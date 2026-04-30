@@ -1968,6 +1968,13 @@ async def deploy(req: DeployReq):
     if email in _running_processes:
         _stop_process(email)
 
+    # Clear any stale 'running' process records so _auto_restart_bots
+    # doesn't re-launch the old broken script on next restart
+    conn_clear = get_db()
+    conn_clear.execute("UPDATE processes SET status='stopped' WHERE email=?", (email,))
+    conn_clear.commit()
+    conn_clear.close()
+
     # Cancel all existing open orders on LongPort (clean slate)
     old_cancelled = _cancel_student_orders(student)
 
@@ -2785,6 +2792,20 @@ async def debug_deploy_test(email: str, key: str = ""):
                 "compile_error": result2.stderr.strip(),
             }
     return {"error": "No bot script found"}
+
+
+@app.post("/api/debug/clear-process")
+async def debug_clear_process(email: str, key: str = ""):
+    """Clear stale running process records for a student. Admin only."""
+    from api.config import ADMIN_PIN
+    if key != ADMIN_PIN:
+        raise HTTPException(403, "Forbidden")
+    email = email.lower().strip()
+    conn = get_db()
+    conn.execute("UPDATE processes SET status='stopped' WHERE email=?", (email,))
+    conn.commit()
+    conn.close()
+    return {"cleared": True, "email": email}
 
 
 @app.get("/api/trades/{email}")
