@@ -2133,12 +2133,16 @@ async def deploy(req: DeployReq):
                 log_excerpt = Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
             except Exception:
                 pass
-            return {
-                "status": "error",
-                "error": f"Bot crashed on startup (exit code {exit_code})",
-                "log_excerpt": log_excerpt,
-                "pid": proc.pid,
-            }
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "error": f"Bot crashed on startup (exit code {exit_code})",
+                    "log_excerpt": log_excerpt,
+                    "pid": proc.pid,
+                }
+            )
 
         return {
             "status": "deployed",
