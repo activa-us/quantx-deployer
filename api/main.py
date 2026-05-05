@@ -20,7 +20,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, Form, BackgroundTasks, Body
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -162,6 +162,7 @@ class StrategyReq(BaseModel):
     library_id: str = ""
     custom_script: str = ""
     broker: str = "longport"
+    is_dry_run: bool = False
 
 
 class ValidateScriptReq(BaseModel):
@@ -1727,7 +1728,7 @@ async def add_strategy(req: StrategyReq):
         email, req.strategy_id, req.strategy_name, req.symbol, req.arena,
         req.timeframe, req.conditions, req.exit_rules, req.risk, req.is_active,
         mode=req.mode, library_id=req.library_id, custom_script=req.custom_script,
-        broker=req.broker,
+        broker=req.broker, is_dry_run=req.is_dry_run,
     )
     return {"status": "saved", "strategy_id": req.strategy_id}
 
@@ -1743,6 +1744,29 @@ async def remove_strategy(strategy_id: str):
 async def toggle_strat(strategy_id: str, active: bool = Query(True)):
     toggle_strategy(strategy_id, active)
     return {"status": "toggled", "strategy_id": strategy_id, "is_active": active}
+
+
+@app.post("/api/strategy/{strategy_id}/clone")
+async def clone_strategy(strategy_id: str, body: dict = Body(...)):
+    """Clone a strategy with a new ID and optionally flip dry_run mode."""
+    from api.database import get_strategies
+    import random, string
+    email = body.get("email", "").lower().strip()
+    strategies = get_strategies(email)
+    src = next((s for s in strategies if s["strategy_id"] == strategy_id), None)
+    if not src:
+        raise HTTPException(404, "Strategy not found")
+    new_id = src["strategy_id"].rsplit("_", 1)[0] + "_" + "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    new_dry_run = body.get("is_dry_run", not src.get("is_dry_run", False))
+    new_name = src["strategy_name"] + (" [DRY]" if new_dry_run else " [LIVE]")
+    save_strategy(
+        email, new_id, new_name, src["symbol"], src["arena"],
+        src["timeframe"], src["conditions"], src["exit_rules"], src["risk"],
+        is_active=False, mode=src["mode"], library_id=src.get("library_id",""),
+        custom_script=src.get("custom_script",""), broker=src.get("broker","longport"),
+        is_dry_run=new_dry_run,
+    )
+    return {"status": "cloned", "new_strategy_id": new_id, "is_dry_run": new_dry_run}
 
 
 @app.get("/api/strategies/{email}")
@@ -1978,6 +2002,10 @@ async def deploy(req: DeployReq):
         existing_states[pos["strategy_id"]] = pos
 
     dry_run = bool(getattr(req, "dry_run", False))
+    # If request didn't set dry_run, fall back to any active strategy's is_dry_run flag
+    if not dry_run:
+        if any(s.get("is_dry_run") for s in lp_strats):
+            dry_run = True
     try:
         script_path, log_path = generate_lp_master_bot(
             email, lp_strats, lp_creds, dry_run=dry_run)

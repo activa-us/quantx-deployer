@@ -136,6 +136,11 @@ def init_db():
         conn.commit()
     except Exception:
         pass
+    try:
+        conn.execute("ALTER TABLE strategies ADD COLUMN is_dry_run INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
     # Data cache table
     try:
         from .data_manager import init_data_cache
@@ -279,14 +284,14 @@ def save_strategy(email: str, strategy_id: str, strategy_name: str, symbol: str,
                   arena: str, timeframe: str, conditions: dict, exit_rules: dict,
                   risk: dict, is_active: bool = True, mode: str = "library",
                   library_id: str = "", custom_script: str = "",
-                  broker: str = "longport"):
+                  broker: str = "longport", is_dry_run: bool = False):
     conn = get_db()
     try:
         conn.execute(
             """INSERT INTO strategies (email, strategy_id, strategy_name, symbol, arena, timeframe,
                                       conditions_json, exit_rules_json, risk_json, is_active,
-                                      mode, library_id, custom_script, broker)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      mode, library_id, custom_script, broker, is_dry_run)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(strategy_id) DO UPDATE SET
                  strategy_name=excluded.strategy_name,
                  symbol=excluded.symbol,
@@ -299,10 +304,12 @@ def save_strategy(email: str, strategy_id: str, strategy_name: str, symbol: str,
                  mode=excluded.mode,
                  library_id=excluded.library_id,
                  custom_script=excluded.custom_script,
-                 broker=excluded.broker""",
+                 broker=excluded.broker,
+                 is_dry_run=excluded.is_dry_run""",
             (email, strategy_id, strategy_name, symbol, arena, timeframe,
              json.dumps(conditions), json.dumps(exit_rules), json.dumps(risk),
-             1 if is_active else 0, mode, library_id, custom_script, broker),
+             1 if is_active else 0, mode, library_id, custom_script, broker,
+             1 if is_dry_run else 0),
         )
         conn.commit()
     finally:
@@ -338,6 +345,7 @@ def get_strategies(email: str, active_only: bool = False) -> list[dict]:
                 "backtest_results": json.loads(r["backtest_results_json"]) if "backtest_results_json" in rk and r["backtest_results_json"] else None,
                 "live_results": json.loads(r["live_results_json"]) if "live_results_json" in rk and r["live_results_json"] else None,
                 "trade_log": json.loads(r["trade_log_json"]) if "trade_log_json" in rk and r["trade_log_json"] else [],
+                "is_dry_run": bool(r["is_dry_run"]) if "is_dry_run" in rk else False,
             }
             result.append(d)
         return result
