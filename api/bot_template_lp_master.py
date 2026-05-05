@@ -624,7 +624,7 @@ def main():
         logger.info('LongPort connected (2 connections: quote + trade)')
 
     # ── Classify strategies: signal-based vs grid ──────────────────────────
-    # The __SIGNAL_FUNCTIONS_BLOCK__ block defines compute_signals_XXXX for each strategy
+    # The SIGNAL_FUNCTIONS_BLOCK block defines compute_signals_XXXX for each strategy
     signal_states = []   # StrategyState — bar poll loop
     grid_states   = []   # GridState     — event-driven quote subscription
 
