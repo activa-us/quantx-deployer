@@ -2647,6 +2647,77 @@ async def debug_clear_process(email: str, key: str = ""):
     return {"cleared": True, "email": email}
 
 
+@app.post("/api/admin/clear-bot-scripts")
+async def clear_bot_scripts(request: Request):
+    """Emergency cleanup: kill processes, delete stale scripts, reset DB."""
+    from fastapi.responses import JSONResponse
+    body = await request.json()
+    pin = body.get("pin", "")
+    if pin != os.environ.get("ADMIN_PIN", "quantx2025"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    email = body.get("email", "")
+    import glob, signal as _sig
+
+    conn = get_db()
+    deleted_files = []
+    killed_pids = []
+
+    try:
+        # Kill running processes
+        if email:
+            rows = conn.execute(
+                "SELECT pid, master_script_path FROM processes WHERE email=? AND status='running'",
+                (email,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT pid, master_script_path FROM processes WHERE status='running'"
+            ).fetchall()
+
+        for row in rows:
+            pid = row["pid"]
+            if pid:
+                try:
+                    os.kill(pid, _sig.SIGTERM)
+                    killed_pids.append(pid)
+                except Exception:
+                    pass
+
+        # Delete stale bot script files
+        email_safe = email.replace("@", "_at_").replace(".", "_") if email else "*"
+        pattern = str(BOTS_DIR / f"{email_safe}_lp_master.py")
+        for f in glob.glob(pattern):
+            try:
+                os.remove(f)
+                deleted_files.append(f)
+            except Exception:
+                pass
+
+        # Also delete any other bot scripts for this email
+        for f in glob.glob(str(BOTS_DIR / f"{email_safe}*.py")):
+            try:
+                os.remove(f)
+                deleted_files.append(f)
+            except Exception:
+                pass
+
+        # Reset processes table
+        if email:
+            conn.execute("UPDATE processes SET status='stopped', pid=NULL WHERE email=?", (email,))
+        else:
+            conn.execute("UPDATE processes SET status='stopped', pid=NULL")
+        conn.commit()
+
+        return {
+            "killed_pids": killed_pids,
+            "deleted_files": deleted_files,
+            "message": f"Cleared {len(killed_pids)} processes and {len(deleted_files)} files"
+        }
+    finally:
+        conn.close()
+
+
 @app.get("/api/trades/{email}")
 async def trades_list(email: str):
     email = email.lower().strip()
