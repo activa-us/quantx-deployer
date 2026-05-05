@@ -3231,6 +3231,8 @@ function openBotDetail(sid) {
   document.getElementById('bd-dd').className = 'stat-value red';
   document.getElementById('bd-trades').textContent = mf(bt.total_trades);
   document.getElementById('bd-no-bt').style.display = hasBt ? 'none' : '';
+  // Load live trades (will override top-5 metrics with real data if trades exist)
+  loadBotLiveTrades();
   // Settings fields
   document.getElementById('bd-set-name').value = _currentBot.strategy_name || '';
   document.getElementById('bd-set-symbol').value = _currentBot.symbol || '';
@@ -3268,8 +3270,6 @@ function openBotDetail(sid) {
   // Load strategy param editor for library bots
   bdLoadParamEditor(_currentBot);
   hideDeleteConfirm();
-  // Load live trades
-  loadBotLiveTrades();
   // Auto-open Strategy tab for Studio-built bots
   const _el = _bdGetSection(_currentBot, 'entry_long');
   const isStudio = _currentBot.mode === 'studio' || _currentBot.mode === 'builder'
@@ -3440,7 +3440,7 @@ function bdEditInStudio() {
 
 async function loadBotLiveTrades() {
   if (!_currentBot || !EMAIL) return;
-  const isDry = !!_currentBot.dry_run;
+  const isDry = !!(_currentBot.is_dry_run || _currentBot.dry_run);
 
   // Update mode badge in header
   const modeBadge = document.getElementById('bd-mode-badge');
@@ -3466,30 +3466,162 @@ async function loadBotLiveTrades() {
   try {
     const r = await fetch(API + '/api/trades/' + encodeURIComponent(EMAIL));
     const all = await r.json();
-    // API returns {trades: [...], by_strategy: {...}} — not a plain array
     const allTrades = all.trades || (Array.isArray(all) ? all : []);
     const trades = allTrades.filter(t => t.strategy_id === _currentBot.strategy_id);
-    // Only count sells (pnl > 0 entries) for P/L — skip buys (pnl=0)
-    const sellTrades = trades.filter(t => ['sld','sell','DRY_SLD'].includes((t.side||'').toLowerCase()) || t.pnl > 0);
+
     if (trades.length === 0) {
       document.getElementById('bd-live-empty').style.display = '';
       document.getElementById('bd-live-pnl').textContent = '—';
       document.getElementById('bd-live-count').textContent = '0';
       document.getElementById('bd-live-last').textContent = '—';
-    } else {
-      document.getElementById('bd-live-empty').style.display = 'none';
-      const totalPnl = sellTrades.reduce((s, t) => s + (t.pnl || 0), 0);
-      document.getElementById('bd-live-pnl').textContent = '$' + totalPnl.toFixed(2);
-      document.getElementById('bd-live-pnl').className = 'stat-value ' + (totalPnl >= 0 ? 'green' : 'red');
-      document.getElementById('bd-live-count').textContent = trades.length;
-      // Format last trade timestamp nicely
-      const ts = trades[0].timestamp || '';
-      const lastTs = ts ? new Date(ts).toLocaleTimeString('en-SG', {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
-      document.getElementById('bd-live-last').textContent = lastTs;
+      _renderLiveMetrics(null);
+      _renderEquityCurve([]);
+      return;
     }
-  } catch (e) {
+
+    document.getElementById('bd-live-empty').style.display = 'none';
+
+    // Separate buys and sells
+    const sells = trades.filter(t => ['sld','sell','dry_sld'].includes((t.side||'').toLowerCase()) || t.pnl > 0);
+    const totalPnl = sells.reduce((s, t) => s + (t.pnl || 0), 0);
+
+    document.getElementById('bd-live-pnl').textContent = '$' + totalPnl.toFixed(2);
+    document.getElementById('bd-live-pnl').className = 'stat-value ' + (totalPnl >= 0 ? 'green' : 'red');
+    document.getElementById('bd-live-count').textContent = trades.length;
+    const ts = trades[0].timestamp || '';
+    const lastTs = ts ? new Date(ts).toLocaleTimeString('en-SG', {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
+    document.getElementById('bd-live-last').textContent = lastTs;
+
+    // Compute live metrics from trades
+    _renderLiveMetrics({ trades, sells, totalPnl });
+
+    // Render equity curve using cumulative_pnl series (sorted oldest first)
+    const sorted = [...trades].sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
+    _renderEquityCurve(sorted);
+
+  } catch(e) {
     document.getElementById('bd-live-empty').style.display = '';
   }
+}
+
+function _renderLiveMetrics({ trades, sells, totalPnl } = {}) {
+  const allocation = (_currentBot.allocation || (_currentBot.risk||{}).capital || 10000);
+  if (!trades || trades.length === 0) {
+    // Clear to backtest data or dashes
+    const bt = _currentBot.backtest_results || {};
+    const mf = v => v !== undefined && v !== null ? (typeof v === 'number' ? v.toFixed(1) : v) : '—';
+    document.getElementById('bd-return').textContent = bt.total_return_pct !== undefined ? mf(bt.total_return_pct) + '%' : '—%';
+    document.getElementById('bd-sharpe').textContent = mf(bt.sharpe_ratio);
+    document.getElementById('bd-winrate').textContent = bt.win_rate_pct !== undefined ? mf(bt.win_rate_pct) + '%' : '—%';
+    document.getElementById('bd-dd').textContent = bt.max_drawdown_pct !== undefined ? mf(bt.max_drawdown_pct) + '%' : '—%';
+    document.getElementById('bd-trades').textContent = mf(bt.total_trades);
+    document.getElementById('bd-no-bt').style.display = bt.total_return_pct !== undefined ? 'none' : '';
+    return;
+  }
+  document.getElementById('bd-no-bt').style.display = 'none';
+
+  // Return %
+  const retPct = (totalPnl / allocation) * 100;
+  const retEl = document.getElementById('bd-return');
+  retEl.textContent = retPct.toFixed(2) + '%';
+  retEl.className = 'stat-value ' + (retPct >= 0 ? 'green' : 'red');
+
+  // Win rate
+  const wins = sells.filter(t => t.pnl > 0).length;
+  const winRate = sells.length > 0 ? (wins / sells.length) * 100 : 0;
+  document.getElementById('bd-winrate').textContent = winRate.toFixed(1) + '%';
+
+  // Trade count
+  document.getElementById('bd-trades').textContent = trades.length;
+
+  // Max drawdown from cumulative_pnl series
+  const sorted = [...trades].sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
+  let peak = 0, maxDd = 0;
+  sorted.forEach(t => {
+    const cum = t.cumulative_pnl || 0;
+    if (cum > peak) peak = cum;
+    const dd = peak > 0 ? ((peak - cum) / (allocation + peak)) * 100 : 0;
+    if (dd > maxDd) maxDd = dd;
+  });
+  const ddEl = document.getElementById('bd-dd');
+  ddEl.textContent = '-' + maxDd.toFixed(1) + '%';
+  ddEl.className = 'stat-value red';
+
+  // Sharpe — daily grouped returns
+  const byDay = {};
+  sorted.forEach(t => {
+    if (t.pnl <= 0) return; // only completed sell PnL
+    const day = (t.timestamp || '').slice(0, 10);
+    if (!byDay[day]) byDay[day] = 0;
+    byDay[day] += t.pnl;
+  });
+  const dailyRets = Object.values(byDay).map(p => p / allocation);
+  if (dailyRets.length >= 2) {
+    const mean = dailyRets.reduce((a,b) => a+b, 0) / dailyRets.length;
+    const std = Math.sqrt(dailyRets.map(r => (r-mean)**2).reduce((a,b)=>a+b,0) / dailyRets.length);
+    const sharpe = std > 0 ? (mean / std) * Math.sqrt(252) : 0;
+    document.getElementById('bd-sharpe').textContent = sharpe.toFixed(2);
+  } else {
+    document.getElementById('bd-sharpe').textContent = '—';
+  }
+}
+
+function _renderEquityCurve(trades) {
+  const canvas = document.getElementById('bd-chart');
+  if (!canvas) return;
+  // Destroy existing chart
+  if (window._bdChartInstance) { window._bdChartInstance.destroy(); window._bdChartInstance = null; }
+  if (!trades || trades.length === 0) return;
+
+  // Build cumulative PnL series (sell trades only for smooth curve)
+  const sells = trades.filter(t => ['sld','sell','dry_sld'].includes((t.side||'').toLowerCase()) || t.pnl > 0);
+  if (sells.length < 2) return;
+
+  const labels = sells.map(t => {
+    const d = new Date(t.timestamp);
+    return d.toLocaleDateString('en-SG', {month:'short',day:'numeric'}) + ' ' +
+           d.toLocaleTimeString('en-SG', {hour:'2-digit',minute:'2-digit'});
+  });
+  const data = sells.map(t => parseFloat((t.cumulative_pnl || 0).toFixed(2)));
+
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  const lineColor = data[data.length-1] >= 0 ? '#16A34A' : '#DC2626';
+  const fillColor = data[data.length-1] >= 0 ? 'rgba(22,163,74,0.08)' : 'rgba(220,38,38,0.08)';
+
+  window._bdChartInstance = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        data,
+        borderColor: lineColor,
+        backgroundColor: fillColor,
+        fill: true,
+        tension: 0.3,
+        pointRadius: sells.length > 50 ? 0 : 3,
+        borderWidth: 2,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => ' $' + ctx.parsed.y.toFixed(2),
+          }
+        }
+      },
+      scales: {
+        x: { display: sells.length <= 100, ticks: { maxTicksLimit: 6, font: { size: 10 } } },
+        y: {
+          ticks: { callback: v => '$' + v, font: { size: 10 } },
+          grid: { color: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)' }
+        }
+      }
+    }
+  });
 }
 
 function showBdTab(tab) {
@@ -3548,7 +3680,7 @@ function updateBdToggleBtn() {
   // Refresh mode badge
   const modeBadge = document.getElementById('bd-mode-badge');
   if (modeBadge) {
-    const isDry = !!_currentBot.dry_run;
+    const isDry = !!(_currentBot.is_dry_run || _currentBot.dry_run);
     if (_currentBot.is_active) {
       modeBadge.style.display = '';
       modeBadge.innerHTML = isDry
