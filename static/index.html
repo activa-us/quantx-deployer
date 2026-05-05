@@ -481,8 +481,9 @@ label { display:block; font-size:12px; font-weight:600; color:var(--text-seconda
   <div id="bots-equity-section">
   <div class="filter-bar">
     <span class="filter-pill active" onclick="filterBots('all',this)">All</span>
-    <span class="filter-pill" onclick="filterBots('live',this)">Live</span>
-    <span class="filter-pill" onclick="filterBots('off',this)">Off</span>
+    <span class="filter-pill" onclick="filterBots('live',this)">🔴 Live</span>
+    <span class="filter-pill" onclick="filterBots('dry',this)">🧪 Dry Run</span>
+    <span class="filter-pill" onclick="filterBots('off',this)">⏹ Off</span>
     <input type="text" class="filter-search" placeholder="Search bots..." oninput="filterBotSearch(this.value)">
   </div>
   <div id="bots-dupe-banner" style="display:none;background:var(--orange-light);border:1px solid #FFCC80;border-radius:6px;padding:10px 16px;margin-bottom:16px;font-size:13px;color:var(--orange);display:none"><span></span> <button class="btn btn-sm" onclick="cleanupDuplicates()" style="margin-left:8px;background:var(--orange);color:#fff;border:none;padding:4px 12px;border-radius:4px;font-size:11px;cursor:pointer">Clean up</button></div>
@@ -494,7 +495,7 @@ label { display:block; font-size:12px; font-weight:600; color:var(--text-seconda
   </div>
   <div class="card" style="padding:0;overflow:hidden">
     <table id="bots-table">
-      <thead><tr><th style="width:40px"></th><th>Bot Name</th><th>Broker</th><th>Symbol</th><th>Strategy</th><th>Return</th><th>Sharpe</th><th>Trades</th><th style="width:100px">Status</th><th style="width:40px"></th></tr></thead>
+      <thead><tr><th style="width:40px"></th><th>Bot Name</th><th>Broker</th><th>Symbol</th><th>Strategy</th><th>Mode</th><th>Return</th><th>Trades</th><th style="width:120px">Status</th><th style="width:40px"></th></tr></thead>
       <tbody id="bots-tbody"></tbody>
     </table>
     <div id="bots-empty" class="empty-state" style="display:none">
@@ -1684,6 +1685,26 @@ label { display:block; font-size:12px; font-weight:600; color:var(--text-seconda
   <div class="modal">
     <div class="modal-header"><div class="modal-title">New Bot</div><button class="modal-close" onclick="closeModal('newbot-modal')">×</button></div>
     <div id="nb-step1">
+      <!-- Mode selector -->
+      <div class="form-group" style="margin-bottom:14px">
+        <label>Bot Mode</label>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px">
+          <label id="nb-mode-dry-label" onclick="setNbMode('dry')" style="display:flex;align-items:center;gap:10px;padding:10px 14px;border:2px solid #6D28D9;border-radius:8px;cursor:pointer;background:#F5F3FF">
+            <input type="radio" name="nb-mode" id="nb-mode-dry" value="dry" checked style="accent-color:#6D28D9">
+            <div>
+              <div style="font-weight:600;font-size:13px;color:#5B21B6">🧪 Dry Run</div>
+              <div style="font-size:11px;color:#7C3AED">Simulated — no real orders</div>
+            </div>
+          </label>
+          <label id="nb-mode-live-label" onclick="setNbMode('live')" style="display:flex;align-items:center;gap:10px;padding:10px 14px;border:2px solid var(--border);border-radius:8px;cursor:pointer;background:var(--surface)">
+            <input type="radio" name="nb-mode" id="nb-mode-live" value="live" style="accent-color:#16A34A">
+            <div>
+              <div style="font-weight:600;font-size:13px;color:#166534">🔴 Live</div>
+              <div style="font-size:11px;color:#15803D">Real orders on LongPort</div>
+            </div>
+          </label>
+        </div>
+      </div>
       <div class="form-group"><label>Broker</label>
         <div style="display:flex;gap:8px">
           <span class="filter-pill active" id="nb-broker-lp" onclick="setNbBroker('longport')">LongPort</span>
@@ -1711,8 +1732,9 @@ label { display:block; font-size:12px; font-weight:600; color:var(--text-seconda
       <div class="form-group"><label>Bot Name</label><input type="text" id="nb-name" placeholder="My Bot"></div>
       <div id="nb-error" style="color:var(--red);font-size:12px;min-height:18px;margin-bottom:8px"></div>
       <div style="display:flex;gap:8px">
-        <button class="btn btn-primary" onclick="createBot()" style="flex:1">Create Bot</button>
-        <button class="btn btn-primary" onclick="createAndDeployBot()" style="flex:1;background:var(--green)">Create & Deploy</button>
+        <button class="btn btn-outline" onclick="closeModal('newbot-modal')" style="flex:1">Cancel</button>
+        <button class="btn btn-primary" onclick="createBot(false)" style="flex:1" id="nb-create-btn">Create Bot</button>
+        <button class="btn btn-primary" onclick="createBot(true)" style="flex:1;background:var(--green)" id="nb-deploy-btn">Create & Deploy</button>
       </div>
     </div>
   </div>
@@ -2677,6 +2699,8 @@ async function loadBots() {
     const d = await r.json();
     USER_STRATEGIES = Array.isArray(d) ? d : (d.strategies || []);
     console.log('[BOTS] Loaded', USER_STRATEGIES.length, 'user strategies');
+    // Fetch live P/L for all bots from trades DB (async, non-blocking)
+    _fetchBotsPnl();
     // Get real subprocess state
     try {
       const sr = await fetch(API + '/api/status/' + encodeURIComponent(EMAIL));
@@ -2703,7 +2727,8 @@ function renderBots() {
   const tbody = document.getElementById('bots-tbody');
   const empty = document.getElementById('bots-empty');
   let list = USER_STRATEGIES;
-  if (_botFilter === 'live') list = list.filter(s => s.is_active);
+  if (_botFilter === 'live') list = list.filter(s => s.is_active && !s.is_dry_run && !s.dry_run);
+  if (_botFilter === 'dry') list = list.filter(s => s.is_active && (s.is_dry_run || s.dry_run));
   if (_botFilter === 'off') list = list.filter(s => !s.is_active);
   if (_botSearch) list = list.filter(s => ((s.strategy_name||'') + (s.symbol||'') + (s.library_id||'')).toLowerCase().includes(_botSearch.toLowerCase()));
 
@@ -2724,17 +2749,28 @@ function renderBots() {
     const bt = s.backtest_results || {};
     const mf = v => v !== undefined && v !== null ? (typeof v === 'number' ? v.toFixed(1) : v) : '—';
     const retClass = (bt.total_return_pct || 0) >= 0 ? 'green' : 'red';
+    const isDry = s.is_dry_run || s.dry_run;
+    const modeBadge = isDry
+      ? '<span style="background:#EDE9FE;color:#5B21B6;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600">🧪 Dry</span>'
+      : '<span style="background:#DCFCE7;color:#166534;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600">🔴 Live</span>';
+    // Live P/L from cached trades (populated by pollBotPnl)
+    const livePnl = s._live_pnl !== undefined
+      ? `<span style="font-weight:600;color:${s._live_pnl>=0?'var(--green)':'var(--red)'}">$${s._live_pnl.toFixed(0)}</span>`
+      : '<span style="color:var(--text-muted)">—</span>';
     return `<tr onclick="openBotDetail('${s.strategy_id}')">
       <td style="font-size:20px">🤖</td>
-      <td><strong>${s.strategy_name || s.strategy_id}</strong></td>
+      <td><strong>${esc(s.strategy_name || s.strategy_id)}</strong></td>
       <td><span class="badge badge-blue">LongPort</span></td>
-      <td style="font-weight:600;color:var(--blue-primary)">${s.symbol}${s.current_position ? '<div style="font-size:10px;font-weight:400;color:' + (s.current_position > 0 ? 'var(--green)' : 'var(--red)') + '">' + (s.current_position > 0 ? 'Long' : 'Short') + ' ' + Math.abs(s.current_position) + ' @ $' + (s.position_entry_price||0).toFixed(2) + '</div>' : ''}</td>
-      <td>${s.library_id || s.mode || '—'}</td>
+      <td style="font-weight:600;color:var(--blue-primary)">${esc(s.symbol)}</td>
+      <td>${esc(s.library_id || s.mode || '—')}</td>
+      <td>${modeBadge}</td>
       <td class="stat-value ${retClass}" style="font-size:13px">${mf(bt.total_return_pct)}%</td>
-      <td>${mf(bt.sharpe_ratio)}</td>
-      <td>${mf(bt.total_trades)}</td>
+      <td>${livePnl}</td>
       <td onclick="event.stopPropagation()" id="btn-${s.strategy_id}">${_renderDeployBtn(s)}</td>
-      <td onclick="event.stopPropagation()" id="del-${s.strategy_id}"><span style="cursor:pointer;opacity:.4;font-size:14px" onclick="confirmDeleteRow('${s.strategy_id}')" title="Delete bot">🗑</span></td>
+      <td onclick="event.stopPropagation()" style="display:flex;gap:4px;align-items:center">
+        <span style="cursor:pointer;opacity:.5;font-size:14px" onclick="openCloneBot('${s.strategy_id}')" title="Clone bot">⧉</span>
+        <span style="cursor:pointer;opacity:.4;font-size:14px" id="del-${s.strategy_id}" onclick="confirmDeleteRow('${s.strategy_id}')" title="Delete bot">🗑</span>
+      </td>
     </tr>`;
   }).join('');
 }
@@ -2746,6 +2782,30 @@ function filterBots(f, el) {
   renderBots();
 }
 function filterBotSearch(v) { _botSearch = v; renderBots(); }
+
+async function _fetchBotsPnl() {
+  if (!EMAIL || !USER_STRATEGIES.length) return;
+  try {
+    const r = await fetch(API + '/api/trades/' + encodeURIComponent(EMAIL));
+    const all = await r.json();
+    const allTrades = all.trades || (Array.isArray(all) ? all : []);
+    // Group by strategy_id and sum sell PnL
+    const pnlMap = {};
+    allTrades.forEach(t => {
+      const sid = t.strategy_id;
+      if (!pnlMap[sid]) pnlMap[sid] = 0;
+      if (['sld','sell','dry_sld'].includes((t.side||'').toLowerCase()) || t.pnl > 0) {
+        pnlMap[sid] += (t.pnl || 0);
+      }
+    });
+    USER_STRATEGIES.forEach(s => {
+      if (pnlMap[s.strategy_id] !== undefined) {
+        s._live_pnl = pnlMap[s.strategy_id];
+      }
+    });
+    renderBots();
+  } catch(e) { /* silent fail */ }
+}
 
 function checkDuplicateBots() {
   const seen = {};
@@ -2796,22 +2856,28 @@ let _deployedAt = 0; // timestamp of last deploy
 function _renderDeployBtn(s) {
   const isRunning = LP_BOT_RUNNING && s.is_active;
   if (s._toggling) return `<button class="deploy-btn deploy-btn-loading" disabled>\u27F3 ${s._toggling === 'deploy' ? 'Deploying...' : 'Stopping...'}</button>`;
+  const isDry = s.is_dry_run || s.dry_run;
   if (isRunning) {
-    const dryBadge = s.dry_run ? ' <span style="background:#EDE9FE;color:#6D28D9;padding:1px 5px;border-radius:4px;font-size:10px;margin-left:4px">DRY</span>' : '';
-    return `<button class="deploy-btn deploy-btn-on" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',false)">\u25A0 Stop</button>${dryBadge}`;
+    const badge = isDry
+      ? ' <span style="background:#EDE9FE;color:#6D28D9;padding:1px 5px;border-radius:4px;font-size:10px;margin-left:4px">DRY</span>'
+      : ' <span style="background:#DCFCE7;color:#166534;padding:1px 5px;border-radius:4px;font-size:10px;margin-left:4px">LIVE</span>';
+    return `<button class="deploy-btn deploy-btn-on" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',false)">\u25A0 Stop</button>${badge}`;
   }
-  return `
-    <div style="display:flex;gap:6px">
-      <button class="deploy-btn deploy-btn-off" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',true,false)" title="Deploy live">\u25B6 Deploy</button>
-      <button class="deploy-btn" style="background:#6D28D9;color:white;border:none;padding:6px 10px;border-radius:6px;cursor:pointer;font-size:12px" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',true,true)" title="Simulate trades without real orders">\uD83E\uDDEA Dry Run</button>
-    </div>`;
+  // Stopped — single deploy button, color reflects mode
+  const btnStyle = isDry
+    ? 'background:#6D28D9;color:white;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit'
+    : 'background:var(--green);color:white;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit';
+  const btnLabel = isDry ? '\uD83E\uDDEA Deploy (Dry)' : '\u25B6 Deploy (Live)';
+  return `<button style="${btnStyle}" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',true)">${btnLabel}</button>`;
 }
 
 let _pendingDeploySid = null;
 
-async function toggleBot(sid, active, dryRun=false) {
+async function toggleBot(sid, active) {
   const s = USER_STRATEGIES.find(x => x.strategy_id === sid);
   if (!s) return;
+  // Mode is baked into the bot — read from is_dry_run field
+  const dryRun = !!(s.is_dry_run);
   const broker = s.broker || 'longport';
   const cell = document.getElementById('btn-' + sid);
   s._toggling = active ? 'deploy' : 'stop';
@@ -3026,6 +3092,7 @@ async function createBot(andDeploy = false) {
   const alloc = document.getElementById('nb-alloc').value;
   const broker = document.getElementById('nb-broker').value || 'longport';
   const name = document.getElementById('nb-name').value.trim() || (strat === '__TEST__' ? 'Quick Test ' + sym : strat + ' ' + sym);
+  const isDryRun = document.getElementById('nb-mode-dry')?.checked !== false;
   if (!sym) { errEl.textContent = 'Symbol required'; return; }
   if (!EMAIL) { errEl.textContent = 'Set up account on Home page first'; return; }
   const existing = USER_STRATEGIES.find(s => s.strategy_name === name && s.symbol === sym);
@@ -3054,7 +3121,8 @@ async function createBot(andDeploy = false) {
       exit_rules: {}, risk: isTest ? {lots: 100, tp_pct: 1, sl_pct: 2} : (lib ? lib.default_risk || {} : {}),
       is_active: false, mode: 'library', library_id: isTest ? 'QUICK_TEST' : strat,
       custom_script: '',
-      broker: broker
+      broker: broker,
+      is_dry_run: isDryRun,
     };
     const r = await fetch(API + '/api/strategy', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
@@ -3081,6 +3149,54 @@ async function createBot(andDeploy = false) {
 }
 
 async function createAndDeployBot() { return createBot(true); }
+
+function setNbMode(mode) {
+  const isDry = mode === 'dry';
+  document.getElementById('nb-mode-dry').checked = isDry;
+  document.getElementById('nb-mode-live').checked = !isDry;
+  const dryLabel = document.getElementById('nb-mode-dry-label');
+  const liveLabel = document.getElementById('nb-mode-live-label');
+  if (dryLabel) {
+    dryLabel.style.borderColor = isDry ? '#6D28D9' : 'var(--border)';
+    dryLabel.style.background = isDry ? '#F5F3FF' : 'var(--surface)';
+  }
+  if (liveLabel) {
+    liveLabel.style.borderColor = !isDry ? '#16A34A' : 'var(--border)';
+    liveLabel.style.background = !isDry ? '#F0FDF4' : 'var(--surface)';
+  }
+}
+
+function openCloneBot(sid) {
+  const s = USER_STRATEGIES.find(x => x.strategy_id === sid);
+  if (!s) return;
+  const isDry = !!(s.is_dry_run);
+  const targetMode = isDry ? 'Live' : 'Dry Run';
+  const targetIcon = isDry ? '🔴' : '🧪';
+  const confirmed = confirm(
+    `Clone "${s.strategy_name}" as ${targetIcon} ${targetMode}?\n\n` +
+    `A new bot will be created with the same strategy and parameters.\n` +
+    `Trade history starts fresh.\n\n` +
+    `Original bot: unchanged and still ${s.is_active ? 'running' : 'stopped'}.`
+  );
+  if (!confirmed) return;
+  cloneBot(sid, !isDry);
+}
+
+async function cloneBot(sid, newIsDry) {
+  try {
+    const r = await fetch(API + '/api/strategy/' + encodeURIComponent(sid) + '/clone', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: EMAIL, is_dry_run: newIsDry })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'Clone failed');
+    const modeLabel = newIsDry ? '🧪 Dry Run' : '🔴 Live';
+    showToast(`Cloned as ${modeLabel}: ${d.new_strategy_id}`, 'success');
+    setTimeout(loadBots, 500);
+  } catch(e) {
+    showToast('Clone failed: ' + e.message, 'error');
+  }
+}
 
 /* ═══════════════════ BOT DETAIL ═══════════════════ */
 function openBotDetail(sid) {
