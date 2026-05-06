@@ -1256,14 +1256,19 @@ async def options_backtest_fast(request: Request):
         def _run_modal():
             try:
                 import os as _os
-                # Authenticate Modal from env vars (Railway injects these)
+                import logging as _logging
+                _log = _logging.getLogger("quantx-modal")
                 _os.environ.setdefault("MODAL_TOKEN_ID",     _os.environ.get("MODAL_TOKEN_ID", ""))
                 _os.environ.setdefault("MODAL_TOKEN_SECRET", _os.environ.get("MODAL_TOKEN_SECRET", ""))
-
+                _log.warning("[Modal] token_id present: %s", bool(_os.environ.get("MODAL_TOKEN_ID")))
                 from scripts.precompute_modal import run_backtest_slice
+                _log.warning("[Modal] imported run_backtest_slice OK, dispatching %d slices", len(slices))
                 results = list(run_backtest_slice.map(slices, return_exceptions=True))
+                _log.warning("[Modal] map complete, %d results", len(results))
                 return results
             except Exception as e:
+                import logging as _logging
+                _logging.getLogger("quantx-modal").error("[Modal] FAILED: %s: %s", type(e).__name__, e)
                 return e
 
         try:
