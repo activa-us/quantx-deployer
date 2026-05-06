@@ -2357,7 +2357,7 @@ async function libRunOptimize() {
         param_grid: paramGrid, initial_capital: cap,
         limit: _btLimit, commission_pct: commPct, slippage_pct: slipPct,
         enable_walk_forward: enableWF, enable_monte_carlo: enableMC,
-        email: EMAIL || '', broker_hint: _btDataSource || '',
+        email: EMAIL || '', broker_hint: document.getElementById('bt-broker-yahoo')?.classList.contains('active') ? 'yahoo' : 'longport',
       })
     });
     const d = await r.json();
