@@ -2435,6 +2435,8 @@ function _libOptRenderResults(data, showWF, showMC) {
 function libOptLoadParams(paramsJson) {
   try {
     const params = JSON.parse(paramsJson);
+    // Ensure param inputs exist in DOM before writing values
+    renderParamInputs('bt-params-container', params, 'bt');
     Object.entries(params).forEach(([key, val]) => {
       const el = document.getElementById(`bt-param-${key}`);
       if (el) el.value = val;
