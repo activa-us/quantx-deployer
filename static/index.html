@@ -2403,7 +2403,23 @@ async function libRunOptimize() {
   }
 }
 
+// Optimizer sort state
+let _libOptSortKey = null, _libOptSortAsc = false, _libOptLastData = null, _libOptLastWF = false, _libOptLastMC = false;
+
+function _libOptSort(th, key) {
+  if (_libOptSortKey === key) { _libOptSortAsc = !_libOptSortAsc; }
+  else { _libOptSortKey = key; _libOptSortAsc = key === 'max_drawdown_pct'; }
+  if (!_libOptLastData) return;
+  const sorted = [...(_libOptLastData.results || [])].sort((a, b) => {
+    const av = a.metrics ? (a.metrics[key] || 0) : 0;
+    const bv = b.metrics ? (b.metrics[key] || 0) : 0;
+    return _libOptSortAsc ? av - bv : bv - av;
+  });
+  _libOptRenderResults({..._libOptLastData, results: sorted}, _libOptLastWF, _libOptLastMC);
+}
+
 function _libOptRenderResults(data, showWF, showMC) {
+  _libOptLastData = data; _libOptLastWF = showWF; _libOptLastMC = showMC;
   const results = data.results || [];
   const resEl = document.getElementById('bt-opt-results');
   const table = document.getElementById('bt-opt-table');
@@ -2435,7 +2451,13 @@ function _libOptRenderResults(data, showWF, showMC) {
     const meta = PARAM_META[k] || {};
     thead += `<th style="padding:6px 8px">${esc(meta.label || k)}</th>`;
   });
-  thead += '<th style="padding:6px 8px">Return</th><th style="padding:6px 8px">Sharpe</th><th style="padding:6px 8px">Max DD</th><th style="padding:6px 8px">Win Rate</th><th style="padding:6px 8px">Trades</th>';
+  const _thStyle = 'padding:6px 8px;cursor:pointer;user-select:none;white-space:nowrap';
+  const _thHint = ' title="Click to sort"';
+  thead += '<th style="' + _thStyle + '"' + _thHint + ' onclick="_libOptSort(this,'total_return_pct')">Return ↕</th>';
+  thead += '<th style="' + _thStyle + '"' + _thHint + ' onclick="_libOptSort(this,'sharpe_ratio')">Sharpe ↕</th>';
+  thead += '<th style="' + _thStyle + '"' + _thHint + ' onclick="_libOptSort(this,'max_drawdown_pct')">Max DD ↕</th>';
+  thead += '<th style="' + _thStyle + '"' + _thHint + ' onclick="_libOptSort(this,'win_rate_pct')">Win Rate ↕</th>';
+  thead += '<th style="' + _thStyle + '"' + _thHint + ' onclick="_libOptSort(this,'total_trades')">Trades ↕</th>';
   if (showWF) thead += '<th style="padding:6px 8px">Walk-Fwd</th>';
   if (showMC) thead += '<th style="padding:6px 8px">Monte Carlo</th>';
   thead += '<th style="padding:6px 8px">Load</th>';
@@ -2481,19 +2503,28 @@ function _libOptRenderResults(data, showWF, showMC) {
 function libOptLoadParams(paramsJson) {
   try {
     const params = JSON.parse(paramsJson);
-    // Ensure param inputs exist in DOM before writing values
-    renderParamInputs('bt-params-container', params, 'bt');
+    // Get current library's default_params for proper labels/metadata
+    const strat = document.getElementById('bt-strategy')?.value;
+    const lib = (LIB_CACHE || []).find(l => l.id === strat);
+    // Build params object: start from library defaults, override with loaded values
+    const baseParams = lib && lib.default_params ? Object.assign({}, lib.default_params) : params;
+    Object.keys(params).forEach(k => { if (k in baseParams) baseParams[k] = params[k]; });
+    // Re-render param inputs with correct metadata + loaded values
+    renderParamInputs('bt-params-container', baseParams, 'bt');
+    // Set values explicitly after render (inputs are newly created)
     Object.entries(params).forEach(([key, val]) => {
-      const el = document.getElementById(`bt-param-${key}`);
+      const el = document.getElementById('bt-param-' + key);
       if (el) el.value = val;
-      // Also update _libOptParams current values
-      const p = _libOptParams.find(p => p.key === key);
+      const p = (_libOptParams || []).find(p => p.key === key);
       if (p) p.current = val;
     });
-    showToast('Parameters loaded — click Run Backtest to verify', 'success');
-    // Scroll up to params
-    document.getElementById('bt-params-container')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  } catch(e) { showToast('Failed to load params', 'error'); }
+    // Scroll to params and show backtest button
+    document.getElementById('bt-params-container')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    showToast('✅ Parameters loaded — click Run Backtest', 'success');
+  } catch(e) {
+    console.error('libOptLoadParams error:', e);
+    showToast('Failed to load params: ' + e.message, 'error');
+  }
 }
 
 // ── Bot Settings: load params for current bot ──────────────────────────────
@@ -3220,11 +3251,14 @@ async function createBot(andDeploy = false) {
           BOT_RUNNING = true;
           setTimeout(() => {
             hideDeployOverlay();
+            navigate('bots');
             showToast('✅ Bot deployed: ' + name, 'success');
+            // Show skeleton while bots load
+            const bl = document.getElementById('bots-list');
+            if (bl) bl.innerHTML = '<tr><td colspan="8" style="padding:24px;text-align:center;color:var(--text-secondary)"><span class="spinner" style="width:20px;height:20px;display:inline-block;margin-right:8px"></span>Loading bots...</td></tr>';
+            setTimeout(loadBots, 2500);
           }, 1200);
         }
-        navigate('bots');
-        setTimeout(loadBots, 2000);
       } catch (de) {
         hideDeployOverlay();
         closeModal('newbot-modal');
