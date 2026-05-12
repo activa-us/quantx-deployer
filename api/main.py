@@ -3118,6 +3118,46 @@ async def trade_report(req: TradeReq):
     # Log locally
     cum_pnl = log_trade(email, req.strategy_id, req.symbol, req.side, req.price, req.qty, req.pnl)
 
+    # Update strategy live_results + trade_log if this is a closed trade (pnl is set)
+    if req.strategy_id and req.pnl != 0.0:
+        try:
+            conn_live = get_db()
+            row = conn_live.execute(
+                "SELECT trade_log_json, allocation FROM strategies WHERE strategy_id = ?",
+                (req.strategy_id,)).fetchone()
+            if row:
+                log = json.loads(row["trade_log_json"]) if row["trade_log_json"] else []
+                log.append({
+                    "date": "",
+                    "side": req.side, "symbol": req.symbol,
+                    "price": req.price, "qty": req.qty, "pnl": req.pnl,
+                })
+                alloc = float(row["allocation"]) if row["allocation"] else 10000
+                pnls = [t.get("pnl", 0) for t in log]
+                total_pnl = sum(pnls)
+                wins = sum(1 for p in pnls if p > 0)
+                total_ret = total_pnl / alloc * 100 if alloc > 0 else 0
+                wr = wins / len(pnls) * 100 if pnls else 0
+                cum = 0; peak = 0; max_dd = 0
+                for p in pnls:
+                    cum += p; peak = max(peak, cum)
+                    dd = (peak - cum) / alloc * 100 if alloc > 0 else 0
+                    max_dd = max(max_dd, dd)
+                live = {
+                    "total_return_pct": round(total_ret, 2),
+                    "win_rate_pct": round(wr, 1),
+                    "max_drawdown_pct": round(max_dd, 2),
+                    "total_trades": len(pnls),
+                    "total_pnl": round(total_pnl, 2),
+                }
+                conn_live.execute(
+                    "UPDATE strategies SET trade_log_json = ?, live_results_json = ? WHERE strategy_id = ?",
+                    (json.dumps(log), json.dumps(live), req.strategy_id))
+                conn_live.commit()
+            conn_live.close()
+        except Exception as _e:
+            _log.warning("[TRADE] Failed to update strategy live_results: %s", _e)
+
     # Forward to central API
     student = get_student(email)
     if student and student.get("central_api_url"):

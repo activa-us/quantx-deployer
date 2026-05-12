@@ -3184,16 +3184,20 @@ async function createBot(andDeploy = false) {
           BOT_RUNNING = true;
           showToast('✅ Bot deployed: ' + name, 'success');
         }
+        navigate('bots');
+        setTimeout(loadBots, 2000);
       } catch (de) {
         closeModal('newbot-modal');
         showToast('Created but deploy failed: ' + de.message, 'error');
+        navigate('bots');
+        setTimeout(loadBots, 500);
       }
     } else {
       closeModal('newbot-modal');
       showToast('Bot created: ' + name, 'success');
+      navigate('bots');
+      setTimeout(loadBots, 500);
     }
-    navigate('bots');
-    setTimeout(loadBots, 2000);
   } catch (e) { errEl.textContent = e.message; }
   btns.forEach(b => { b.disabled = false; b.textContent = b._origText || 'Create Bot'; });
 }
