@@ -2121,6 +2121,8 @@ function populateStrategySelects() {
   const btSel = document.getElementById('bt-strategy');
   if (btSel) {
     btSel.innerHTML = LIB_CACHE.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+    // Auto-select first strategy if none selected
+    if (!btSel.value && btSel.options.length > 0) btSel.value = btSel.options[0].value;
     // Render params for default selected strategy
     btOnStrategyChange(btSel.value);
   }
