@@ -2069,7 +2069,7 @@ async def strategies_library():
 
     if central_url:
         try:
-            async with httpx.AsyncClient(timeout=0.5) as client:  # fast fail — central is down
+            async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(f"{central_url.rstrip('/')}/api/strategies-library")
                 if resp.status_code == 200:
                     return resp.json()
