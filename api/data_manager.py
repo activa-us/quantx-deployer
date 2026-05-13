@@ -1,5 +1,5 @@
 """QuantX Data Manager — Waterfall data fetcher for backtests.
-Priority: 1. Local SQLite cache → 2. LongPort → 3. IBKR → 4. R2 → 5. Yahoo → 6. FMP
+Priority: Local SQLite → IBKR → LongPort → Cloudflare R2 → Yahoo → FMP
 """
 
 import os
@@ -14,7 +14,7 @@ log = logging.getLogger("quantx-data")
 SOURCE_MESSAGES = {
     "local_cache": "Loading from local cache...",
     "ibkr": "Fetching from your IBKR account...",
-    "longport": "Fetched from LongPort API (paginated history)",
+    "longport": "Fetching from your LongPort account...",
     "r2": "Loading from QuantX data library...",
     "yahoo": "Fetching from Yahoo Finance...",
     "fmp": "Fetching from QuantX data server...",
@@ -185,89 +185,105 @@ def fetch_from_yahoo(symbol, timeframe, limit):
         return None
 
 
-# ── LongPort data fetch ──────────────────────────────────────────────────────
+# ── LongPort data fetch ───────────────────────────────────────────────────────
 
-def fetch_from_longport(symbol, timeframe, limit, lp_credentials):
-    """Fetch OHLCV bars from LongPort using paginated history_candlesticks_by_offset.
+# LP bars per API call (hard limit)
+_LP_PAGE_SIZE = 1000
 
-    Uses del ctx (not .close()) to release the connection -- QuoteContext has no close().
-    Max 1000 bars per page, up to 20 pages = 20,000 bars max.
+# Maximum bars we'll paginate for, per timeframe — keeps fetch time reasonable
+_LP_MAX_BARS = {
+    "1min": 5000, "5min": 10000, "15min": 10000, "30min": 3000,
+    "1hour": 3000, "4hour": 3000, "1day": 5500, "1week": 1000,
+}
+
+def fetch_from_longport(symbol: str, timeframe: str, limit: int,
+                        app_key: str, app_secret: str, access_token: str):
+    """
+    Fetch OHLCV bars from LongPort using history_candlesticks_by_offset.
+    Paginates backwards in 1000-bar pages until `limit` bars are collected
+    or no more history exists. Always uses a fresh QuoteContext (not the pool)
+    and cleans it up in a finally block.
+
+    Returns list of bar dicts or None on failure.
     """
     try:
-        from longport.openapi import Config, QuoteContext, Period, AdjustType
-        from .config import normalize_timeframe
+        from longport.openapi import QuoteContext, Config, Period, AdjustType
+    except ImportError:
+        log.warning("longport SDK not installed — skipping LP fetch")
+        return None
 
-        tf = normalize_timeframe(timeframe)
-        period_map = {
-            "1min": Period.Min_1, "5min": Period.Min_5,
-            "15min": Period.Min_15, "30min": Period.Min_30,
-            "1hour": Period.Min_60, "1day": Period.Day, "1week": Period.Week,
-        }
-        period = period_map.get(tf)
-        if period is None:
-            log.warning("LongPort: unsupported timeframe %s (normalized: %s)", timeframe, tf)
-            return None
+    period_map = {
+        "1min":  Period.Min_1,
+        "5min":  Period.Min_5,
+        "15min": Period.Min_15,
+        "30min": Period.Min_30,
+        "1hour": Period.Min_60,
+        "1day":  Period.Day,
+        "1week": Period.Week,
+    }
+    period = period_map.get(timeframe)
+    if period is None:
+        log.warning("LongPort: unsupported timeframe %s", timeframe)
+        return None
 
-        cfg = Config(
-            app_key=lp_credentials["app_key"],
-            app_secret=lp_credentials["app_secret"],
-            access_token=lp_credentials["access_token"],
-        )
+    max_bars = min(limit, _LP_MAX_BARS.get(timeframe, limit))
+    ctx = None
+    try:
+        cfg = Config(app_key=app_key, app_secret=app_secret, access_token=access_token)
         ctx = QuoteContext(cfg)
 
-        try:
-            all_candles = []
-            anchor_time = None
-            max_pages = 20
+        all_candles = []
+        anchor_time = None  # None = start from now, then paginate backwards
 
-            for page in range(max_pages):
-                batch = ctx.history_candlesticks_by_offset(
-                    symbol, period, AdjustType.ForwardAdjust,
-                    forward=False, count=1000, time=anchor_time,
-                )
-                if not batch:
-                    break
-
-                all_candles = list(batch) + all_candles  # prepend older data
-
-                if len(batch) < 1000:
-                    break  # reached beginning of available data
-
-                anchor_time = batch[0].timestamp
-
-                if len(all_candles) >= limit:
-                    break
-        finally:
-            del ctx  # correct way to release QuoteContext -- no .close() method
+        while len(all_candles) < max_bars:
+            batch = ctx.history_candlesticks_by_offset(
+                symbol, period, AdjustType.ForwardAdjust,
+                forward=False, count=_LP_PAGE_SIZE, time=anchor_time
+            )
+            if not batch:
+                break  # no more history
+            all_candles = list(batch) + all_candles
+            if len(batch) < _LP_PAGE_SIZE:
+                break  # got a partial page — we're at the beginning of history
+            # Set anchor to the oldest candle in this batch for next page
+            anchor_time = batch[0].timestamp
 
         if not all_candles:
             return None
 
         bars = []
         for c in all_candles:
-            ts = c.timestamp
-            date_str = ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts)[:19]
-            bars.append({
-                "date": date_str,
-                "open": round(float(c.open), 4),
-                "high": round(float(c.high), 4),
-                "low": round(float(c.low), 4),
-                "close": round(float(c.close), 4),
-                "volume": float(c.volume) if hasattr(c, "volume") else 0.0,
-            })
+            try:
+                ts = c.timestamp
+                # timestamp is a datetime object from the LP SDK
+                date_str = ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts)[:19]
+                bars.append({
+                    "date":   date_str,
+                    "open":   float(c.open),
+                    "high":   float(c.high),
+                    "low":    float(c.low),
+                    "close":  float(c.close),
+                    "volume": float(c.volume) if c.volume is not None else 0.0,
+                })
+            except Exception as e:
+                log.debug("LP candle parse error: %s", e)
+                continue
 
         if len(bars) > limit:
             bars = bars[-limit:]
 
-        log.info("LongPort: %d bars for %s/%s | %s -> %s",
-                 len(bars), symbol, timeframe,
-                 bars[0]["date"][:10] if bars else "?",
-                 bars[-1]["date"][:10] if bars else "?")
+        log.info("LongPort: %d bars for %s/%s", len(bars), symbol, timeframe)
         return bars
 
     except Exception as e:
         log.warning("LongPort fetch failed %s/%s: %s", symbol, timeframe, e)
         return None
+    finally:
+        if ctx is not None:
+            try:
+                del ctx
+            except Exception:
+                pass
 
 
 # ── Main waterfall ────────────────────────────────────────────────────────────
@@ -275,48 +291,39 @@ def fetch_from_longport(symbol, timeframe, limit, lp_credentials):
 def fetch_bars_waterfall_sync(symbol, timeframe, limit, db_path,
                                ibkr_config=None, lp_credentials=None,
                                skip_cache=False):
-    """Synchronous waterfall fetch — call from executor thread."""
-    from .config import normalize_timeframe
+    """Synchronous waterfall fetch — call from executor thread.
+    Priority: Local SQLite → LongPort → R2 → Yahoo → FMP
+    (IBKR removed — platform is LongPort-only)
+    """
     symbol = symbol.upper().strip()
-    timeframe = normalize_timeframe(timeframe)
     base = {"symbol": symbol, "timeframe": timeframe, "bars": [],
             "source": None, "source_message": "", "bar_count": 0, "error": None}
 
-    # 1. Local cache — only use if it has enough bars for what was requested
+    # 1. Local cache
     if not skip_cache:
         cached = load_from_local_cache(db_path, symbol, timeframe)
         if cached:
             bars, src = cached
-            if len(bars) >= limit:
+            if len(bars) >= min(limit, 50):
                 return {**base, "bars": bars[-limit:], "source": src,
                         "source_message": SOURCE_MESSAGES["local_cache"], "bar_count": len(bars)}
-            elif len(bars) >= 50:
-                log.info("Cache has %d bars but %d requested -- re-fetching for more data",
-                         len(bars), limit)
 
-    # 2. LongPort (if credentials provided)
+    # 2. LongPort (student's own account — best data quality, HK/SG/US all supported)
     if lp_credentials and lp_credentials.get("app_key"):
         log.info("Trying LongPort for %s/%s...", symbol, timeframe)
-        bars = fetch_from_longport(symbol, timeframe, limit, lp_credentials)
+        bars = fetch_from_longport(
+            symbol, timeframe, limit,
+            app_key=lp_credentials["app_key"],
+            app_secret=lp_credentials["app_secret"],
+            access_token=lp_credentials["access_token"],
+        )
         if bars and len(bars) >= 20:
             save_to_local_cache(db_path, symbol, timeframe, bars, "longport")
             return {**base, "bars": bars, "source": "longport",
                     "source_message": SOURCE_MESSAGES["longport"], "bar_count": len(bars)}
-        log.warning("LongPort fetch returned insufficient data for %s/%s -- falling through", symbol, timeframe)
+        log.info("LongPort returned no usable bars for %s/%s, falling through", symbol, timeframe)
 
-    # 3. IBKR
-    if ibkr_config and ibkr_config.get("host"):
-        log.info("Trying IBKR for %s/%s...", symbol, timeframe)
-        bars = fetch_from_ibkr(symbol, timeframe, limit,
-                                host=ibkr_config.get("host", "127.0.0.1"),
-                                port=int(ibkr_config.get("port", 7497)),
-                                client_id=int(ibkr_config.get("client_id", 99)))
-        if bars and len(bars) >= 20:
-            save_to_local_cache(db_path, symbol, timeframe, bars, "ibkr")
-            return {**base, "bars": bars, "source": "ibkr",
-                    "source_message": SOURCE_MESSAGES["ibkr"], "bar_count": len(bars)}
-
-    # 4. R2
+    # 3. R2 (QuantX pre-fetched data — covers major US/HK symbols on 1day)
     log.info("Trying R2 for %s/%s...", symbol, timeframe)
     try:
         from .backtest import load_from_r2
@@ -331,7 +338,7 @@ def fetch_bars_waterfall_sync(symbol, timeframe, limit, db_path,
     except Exception as e:
         log.warning("R2 failed: %s", e)
 
-    # 5. Yahoo Finance
+    # 4. Yahoo Finance
     log.info("Trying Yahoo for %s/%s...", symbol, timeframe)
     bars = fetch_from_yahoo(symbol, timeframe, limit)
     if bars and len(bars) >= 20:
@@ -339,7 +346,7 @@ def fetch_bars_waterfall_sync(symbol, timeframe, limit, db_path,
         return {**base, "bars": bars, "source": "yahoo",
                 "source_message": SOURCE_MESSAGES["yahoo"], "bar_count": len(bars)}
 
-    # 6. FMP
+    # 5. FMP
     log.info("Trying FMP for %s/%s...", symbol, timeframe)
     try:
         from .backtest import _fetch_from_fmp
@@ -353,7 +360,7 @@ def fetch_bars_waterfall_sync(symbol, timeframe, limit, db_path,
 
     # No data
     is_intraday_hk_sg = timeframe not in ("1day", "1week") and (symbol.endswith(".HK") or symbol.endswith(".SI"))
-    error = (f"No intraday data for {symbol}/{timeframe}. Connect IBKR for HK/SG intraday."
+    error = (f"No intraday data for {symbol}/{timeframe}. Connect LongPort for HK/SG intraday."
              if is_intraday_hk_sg else
              f"No data for {symbol}/{timeframe}. Check symbol format (700.HK, D05.SI, AAPL.US).")
     return {**base, "source": "none", "source_message": SOURCE_MESSAGES["none"], "error": error}
