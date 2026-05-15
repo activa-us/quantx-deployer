@@ -322,13 +322,21 @@ def _auto_restart_bots():
 
 
 def _startup_prewarm():
-    """Background prewarm top 10 symbols on startup."""
+    """Background prewarm — load top symbols from R2 into local SQLite cache.
+    This means the first backtest after deploy is a local cache hit (instant)
+    instead of a cold R2 network fetch.
+    """
     try:
-        from api.backtest import prewarm_symbol, PREWARM_PRIORITY
+        from api.backtest import load_from_r2, PREWARM_PRIORITY
+        from api.data_manager import save_to_local_cache
         for sym in PREWARM_PRIORITY:
             try:
-                r = prewarm_symbol(sym, "1day")
-                _log.info("[PREWARM] %s: %s", sym, r.get("status", "?"))
+                bars, _ = load_from_r2(sym, "1day")
+                if bars:
+                    save_to_local_cache(str(DB_PATH), sym, "1day", bars, "r2")
+                    _log.info("[PREWARM] %s: %d bars cached to SQLite", sym, len(bars))
+                else:
+                    _log.info("[PREWARM] %s: R2 miss", sym)
             except Exception as e:
                 _log.warning("[PREWARM] %s failed: %s", sym, e)
     except Exception as e:
@@ -866,11 +874,11 @@ async def backtest_run(body: BacktestReq):
         # If user explicitly chose Yahoo, skip broker data sources
         if hint == "yahoo":
             lp_creds = None
-        # Waterfall fetch
+        # Waterfall fetch — pass pooled LP context so no handshake on each call
         data = fetch_bars_waterfall_sync(
             symbol=body.symbol, timeframe=body.timeframe, limit=body.limit,
             db_path=str(DB_PATH), lp_credentials=lp_creds,
-            skip_cache=body.skip_cache)
+            skip_cache=body.skip_cache, _get_lp_ctx_fn=get_lp_quote_ctx)
         if data["error"]:
             return {"status": "error", "message": data["error"],
                     "source": data["source"], "source_message": data["source_message"]}
@@ -937,10 +945,11 @@ async def backtest_optimize(body: OptimizeReq):
         if hint == "yahoo":
             lp_creds = None
 
-        # Waterfall: LongPort → R2 → Yahoo → FMP
+        # Waterfall: local cache → R2 → LongPort → Yahoo → FMP
         data = fetch_bars_waterfall_sync(
             symbol=body.symbol, timeframe=body.timeframe, limit=body.limit,
-            db_path=str(DB_PATH), lp_credentials=lp_creds)
+            db_path=str(DB_PATH), lp_credentials=lp_creds,
+            _get_lp_ctx_fn=get_lp_quote_ctx)
         if data["error"]:
             raise ValueError(data["error"])
         bars = data["bars"]
@@ -1001,7 +1010,8 @@ async def backtest_optimize_stream_lib(request: Request):
                             "access_token": student["access_token"]}
         return fetch_bars_waterfall_sync(
             symbol=symbol, timeframe=timeframe, limit=limit,
-            db_path=str(DB_PATH), lp_credentials=lp_creds)
+            db_path=str(DB_PATH), lp_credentials=lp_creds,
+            _get_lp_ctx_fn=get_lp_quote_ctx)
 
     bars_result = await asyncio.get_event_loop().run_in_executor(_executor, _get_bars)
     bars = bars_result.get("bars", [])
@@ -1072,7 +1082,7 @@ async def backtest_run_script(body: ScriptBacktestReq):
         data = fetch_bars_waterfall_sync(
             symbol=body.symbol, timeframe=body.timeframe, limit=body.limit,
             db_path=str(DB_PATH), lp_credentials=lp_creds,
-            skip_cache=body.skip_cache)
+            skip_cache=body.skip_cache, _get_lp_ctx_fn=get_lp_quote_ctx)
         if data["error"]:
             return {"status": "error", "message": data["error"],
                     "source": data["source"], "source_message": data["source_message"]}
@@ -1121,10 +1131,11 @@ async def backtest_sweep_script(body: SweepScriptReq):
                     "app_secret": student["app_secret"],
                     "access_token": student["access_token"],
                 }
-        # Fetch data ONCE for all combos using full waterfall (LP -> Yahoo)
+        # Fetch data ONCE for all combos using full waterfall
         data = fetch_bars_waterfall_sync(
             symbol=body.symbol, timeframe=body.timeframe, limit=body.limit,
-            db_path=str(DB_PATH), lp_credentials=lp_creds)
+            db_path=str(DB_PATH), lp_credentials=lp_creds,
+            _get_lp_ctx_fn=get_lp_quote_ctx)
         if data["error"] or not data["bars"]:
             raise ValueError(f"No data: {data.get('error','No bars returned')}")
         bars = data["bars"]
@@ -1188,7 +1199,8 @@ async def backtest_optimize_stream(request: Request):
                             "access_token": student["access_token"]}
         return fetch_bars_waterfall_sync(
             symbol=symbol, timeframe=timeframe, limit=limit,
-            db_path=str(DB_PATH), lp_credentials=lp_creds)
+            db_path=str(DB_PATH), lp_credentials=lp_creds,
+            _get_lp_ctx_fn=get_lp_quote_ctx)
     bars_result = await asyncio.get_event_loop().run_in_executor(_executor, _get_bars)
     bars = bars_result.get("bars", [])
     if len(bars) < 50:

@@ -197,14 +197,18 @@ _LP_MAX_BARS = {
 }
 
 def fetch_from_longport(symbol: str, timeframe: str, limit: int,
-                        app_key: str, app_secret: str, access_token: str):
+                        app_key: str, app_secret: str, access_token: str,
+                        _get_ctx_fn=None):
     """
-    Fetch OHLCV bars from LongPort using history_candlesticks_by_offset.
-    Paginates backwards in 1000-bar pages until `limit` bars are collected
-    or no more history exists. Always uses a fresh QuoteContext (not the pool)
-    and cleans it up in a finally block.
+    Fetch OHLCV bars from LongPort.
 
-    Returns list of bar dicts or None on failure.
+    _get_ctx_fn: optional callable(app_key, secret, token) -> pooled QuoteContext.
+    When provided, reuses an existing connected context (no handshake overhead).
+    When None, creates a fresh context and deletes it in finally.
+
+    Strategy:
+    - limit <= 1000: single candlesticks() call (~2s)
+    - limit > 1000:  paginated history_candlesticks_by_offset
     """
     try:
         from longport.openapi import QuoteContext, Config, Period, AdjustType
@@ -226,117 +230,135 @@ def fetch_from_longport(symbol: str, timeframe: str, limit: int,
         log.warning("LongPort: unsupported timeframe %s", timeframe)
         return None
 
-    max_bars = min(limit, _LP_MAX_BARS.get(timeframe, limit))
+    # Get or create context
+    own_ctx = False
     ctx = None
     try:
-        cfg = Config(app_key=app_key, app_secret=app_secret, access_token=access_token)
-        ctx = QuoteContext(cfg)
+        if _get_ctx_fn is not None:
+            ctx = _get_ctx_fn(app_key, app_secret, access_token)
+        else:
+            cfg = Config(app_key=app_key, app_secret=app_secret, access_token=access_token)
+            ctx = QuoteContext(cfg)
+            own_ctx = True
 
+        # ── Fast path: single call for <= 1000 bars ──────────────────────────
+        if limit <= 1000:
+            candles = ctx.candlesticks(symbol, period, limit, AdjustType.ForwardAdjust)
+            if not candles:
+                return None
+            bars = _lp_candles_to_bars(candles, limit)
+            log.info("LongPort (single-call): %d bars for %s/%s", len(bars), symbol, timeframe)
+            return bars if bars else None
+
+        # ── Paginated path: > 1000 bars ──────────────────────────────────────
         all_candles = []
-        anchor_time = None  # None = start from now, then paginate backwards
-
-        while len(all_candles) < max_bars:
+        anchor_time = None
+        while len(all_candles) < limit:
             batch = ctx.history_candlesticks_by_offset(
                 symbol, period, AdjustType.ForwardAdjust,
-                forward=False, count=_LP_PAGE_SIZE, time=anchor_time
+                forward=False, count=_LP_PAGE_SIZE, time=anchor_time,
             )
             if not batch:
-                break  # no more history
+                break
             all_candles = list(batch) + all_candles
             if len(batch) < _LP_PAGE_SIZE:
-                break  # got a partial page — we're at the beginning of history
-            # Set anchor to the oldest candle in this batch for next page
+                break  # reached beginning of available history
             anchor_time = batch[0].timestamp
 
         if not all_candles:
             return None
-
-        bars = []
-        for c in all_candles:
-            try:
-                ts = c.timestamp
-                # timestamp is a datetime object from the LP SDK
-                date_str = ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts)[:19]
-                bars.append({
-                    "date":   date_str,
-                    "open":   float(c.open),
-                    "high":   float(c.high),
-                    "low":    float(c.low),
-                    "close":  float(c.close),
-                    "volume": float(c.volume) if c.volume is not None else 0.0,
-                })
-            except Exception as e:
-                log.debug("LP candle parse error: %s", e)
-                continue
-
-        if len(bars) > limit:
-            bars = bars[-limit:]
-
-        log.info("LongPort: %d bars for %s/%s", len(bars), symbol, timeframe)
-        return bars
+        bars = _lp_candles_to_bars(all_candles, limit)
+        log.info("LongPort (paginated): %d bars for %s/%s", len(bars), symbol, timeframe)
+        return bars if bars else None
 
     except Exception as e:
         log.warning("LongPort fetch failed %s/%s: %s", symbol, timeframe, e)
         return None
     finally:
-        if ctx is not None:
+        if own_ctx and ctx is not None:
             try:
                 del ctx
             except Exception:
                 pass
 
 
+def _lp_candles_to_bars(candles, limit: int) -> list:
+    """Convert LP candle objects to bar dicts, trimmed to limit."""
+    bars = []
+    for c in candles:
+        try:
+            ts = c.timestamp
+            date_str = (ts.strftime("%Y-%m-%d %H:%M:%S")
+                        if hasattr(ts, "strftime") else str(ts)[:19])
+            bars.append({
+                "date":   date_str,
+                "open":   float(c.open),
+                "high":   float(c.high),
+                "low":    float(c.low),
+                "close":  float(c.close),
+                "volume": float(c.volume) if c.volume is not None else 0.0,
+            })
+        except Exception:
+            continue
+    return bars[-limit:] if len(bars) > limit else bars
+
+
 # ── Main waterfall ────────────────────────────────────────────────────────────
 
 def fetch_bars_waterfall_sync(symbol, timeframe, limit, db_path,
                                ibkr_config=None, lp_credentials=None,
-                               skip_cache=False):
+                               skip_cache=False, _get_lp_ctx_fn=None):
     """Synchronous waterfall fetch — call from executor thread.
-    Priority: Local SQLite → LongPort → R2 → Yahoo → FMP
-    (IBKR removed — platform is LongPort-only)
+    Priority: Local SQLite → R2 → LongPort → Yahoo → FMP
+
+    _get_lp_ctx_fn: optional callable(app_key, secret, token) -> pooled QuoteContext.
+    When provided, LongPort fetches reuse an existing connection (no handshake).
     """
     symbol = symbol.upper().strip()
     base = {"symbol": symbol, "timeframe": timeframe, "bars": [],
             "source": None, "source_message": "", "bar_count": 0, "error": None}
 
-    # 1. Local cache
+    # 1. Local SQLite cache (instant — no network)
     if not skip_cache:
         cached = load_from_local_cache(db_path, symbol, timeframe)
         if cached:
             bars, src = cached
             if len(bars) >= min(limit, 50):
                 return {**base, "bars": bars[-limit:], "source": src,
-                        "source_message": SOURCE_MESSAGES["local_cache"], "bar_count": len(bars)}
+                        "source_message": SOURCE_MESSAGES["local_cache"],
+                        "bar_count": len(bars)}
 
-    # 2. LongPort (student's own account — best data quality, HK/SG/US all supported)
+    # 2. R2 (QuantX CDN — covers major US/HK on 1day, single fast fetch)
+    #    Save hits to SQLite so subsequent calls are instant from local cache.
+    log.info("Trying R2 for %s/%s...", symbol, timeframe)
+    try:
+        from .backtest import load_from_r2
+        r2_bars, _ = load_from_r2(symbol, timeframe)
+        if r2_bars and len(r2_bars) >= 20:
+            trimmed = r2_bars[-limit:] if len(r2_bars) > limit else r2_bars
+            save_to_local_cache(db_path, symbol, timeframe, trimmed, "r2")
+            return {**base, "bars": trimmed, "source": "r2",
+                    "source_message": SOURCE_MESSAGES["r2"],
+                    "bar_count": len(trimmed)}
+    except Exception as e:
+        log.warning("R2 failed for %s/%s: %s", symbol, timeframe, e)
+
+    # 3. LongPort (student account — covers HK/SG/intraday not in R2)
     if lp_credentials and lp_credentials.get("app_key"):
-        log.info("Trying LongPort for %s/%s...", symbol, timeframe)
+        log.info("Trying LongPort for %s/%s (limit=%d)...", symbol, timeframe, limit)
         bars = fetch_from_longport(
             symbol, timeframe, limit,
             app_key=lp_credentials["app_key"],
             app_secret=lp_credentials["app_secret"],
             access_token=lp_credentials["access_token"],
+            _get_ctx_fn=_get_lp_ctx_fn,
         )
         if bars and len(bars) >= 20:
             save_to_local_cache(db_path, symbol, timeframe, bars, "longport")
             return {**base, "bars": bars, "source": "longport",
-                    "source_message": SOURCE_MESSAGES["longport"], "bar_count": len(bars)}
-        log.info("LongPort returned no usable bars for %s/%s, falling through", symbol, timeframe)
-
-    # 3. R2 (QuantX pre-fetched data — covers major US/HK symbols on 1day)
-    log.info("Trying R2 for %s/%s...", symbol, timeframe)
-    try:
-        from .backtest import load_from_r2
-        r2_result = load_from_r2(symbol, timeframe)
-        if r2_result:
-            bars, _ = r2_result
-            if bars and len(bars) >= 20:
-                trimmed = bars[-limit:] if len(bars) > limit else bars
-                save_to_local_cache(db_path, symbol, timeframe, trimmed, "r2")
-                return {**base, "bars": trimmed, "source": "r2",
-                        "source_message": SOURCE_MESSAGES["r2"], "bar_count": len(trimmed)}
-    except Exception as e:
-        log.warning("R2 failed: %s", e)
+                    "source_message": SOURCE_MESSAGES["longport"],
+                    "bar_count": len(bars)}
+        log.info("LongPort: no usable bars for %s/%s, falling through", symbol, timeframe)
 
     # 4. Yahoo Finance
     log.info("Trying Yahoo for %s/%s...", symbol, timeframe)
@@ -344,26 +366,34 @@ def fetch_bars_waterfall_sync(symbol, timeframe, limit, db_path,
     if bars and len(bars) >= 20:
         save_to_local_cache(db_path, symbol, timeframe, bars, "yahoo")
         return {**base, "bars": bars, "source": "yahoo",
-                "source_message": SOURCE_MESSAGES["yahoo"], "bar_count": len(bars)}
+                "source_message": SOURCE_MESSAGES["yahoo"],
+                "bar_count": len(bars)}
 
     # 5. FMP
     log.info("Trying FMP for %s/%s...", symbol, timeframe)
     try:
         from .backtest import _fetch_from_fmp
-        bars, src = _fetch_from_fmp(symbol, timeframe, limit)
+        bars, _ = _fetch_from_fmp(symbol, timeframe, limit)
         if bars and len(bars) >= 20:
             save_to_local_cache(db_path, symbol, timeframe, bars, "fmp")
             return {**base, "bars": bars, "source": "fmp",
-                    "source_message": SOURCE_MESSAGES["fmp"], "bar_count": len(bars)}
+                    "source_message": SOURCE_MESSAGES["fmp"],
+                    "bar_count": len(bars)}
     except Exception as e:
-        log.warning("FMP failed: %s", e)
+        log.warning("FMP failed for %s/%s: %s", symbol, timeframe, e)
 
-    # No data
-    is_intraday_hk_sg = timeframe not in ("1day", "1week") and (symbol.endswith(".HK") or symbol.endswith(".SI"))
-    error = (f"No intraday data for {symbol}/{timeframe}. Connect LongPort for HK/SG intraday."
-             if is_intraday_hk_sg else
-             f"No data for {symbol}/{timeframe}. Check symbol format (700.HK, D05.SI, AAPL.US).")
-    return {**base, "source": "none", "source_message": SOURCE_MESSAGES["none"], "error": error}
+    # No data available
+    is_intraday_hk_sg = (timeframe not in ("1day", "1week")
+                         and (symbol.endswith(".HK") or symbol.endswith(".SI")))
+    error = (
+        f"No intraday data for {symbol}/{timeframe}. "
+        "Connect LongPort for HK/SG intraday data."
+        if is_intraday_hk_sg else
+        f"No data found for {symbol}/{timeframe}. "
+        "Check symbol format (e.g. 700.HK, D05.SI, AAPL.US)."
+    )
+    return {**base, "source": "none",
+            "source_message": SOURCE_MESSAGES["none"], "error": error}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

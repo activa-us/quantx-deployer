@@ -72,15 +72,30 @@ def _r2_meta_key(symbol, timeframe):
     return f"{symbol}/{timeframe}/meta.json"
 
 
+_r2_client_singleton = None
+_r2_client_lock = threading.Lock()
+
 def _get_r2():
+    """Return a singleton boto3 S3 client. Creating one per call was causing
+    a TLS handshake + auth round-trip on every R2 fetch (~1-2s overhead)."""
+    global _r2_client_singleton
     if not R2_ENDPOINT:
         return None
-    try:
-        import boto3
-        return boto3.client("s3", endpoint_url=R2_ENDPOINT, aws_access_key_id=R2_KEY_ID,
-                            aws_secret_access_key=R2_SECRET, region_name="auto")
-    except Exception:
-        return None
+    if _r2_client_singleton is not None:
+        return _r2_client_singleton
+    with _r2_client_lock:
+        if _r2_client_singleton is None:
+            try:
+                import boto3
+                _r2_client_singleton = boto3.client(
+                    "s3", endpoint_url=R2_ENDPOINT,
+                    aws_access_key_id=R2_KEY_ID,
+                    aws_secret_access_key=R2_SECRET,
+                    region_name="auto",
+                )
+            except Exception:
+                return None
+    return _r2_client_singleton
 
 
 def load_from_r2(symbol, timeframe):
