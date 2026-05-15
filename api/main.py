@@ -411,6 +411,19 @@ async def lifespan(app: FastAPI):
     if HOSTING == "railway":
         threading.Thread(target=_orchestrator_loop, daemon=True, name="orchestrator").start()
         _log.info("[ORCH] Orchestrator thread started (Railway mode)")
+
+    # Schedule LP pool cleanup every 5 minutes (non-blocking background task)
+    async def _pool_cleanup_loop():
+        while True:
+            await asyncio.sleep(300)  # 5 minutes
+            try:
+                n = cleanup_lp_pool()
+                if n:
+                    _log.info("[LP-pool] Periodic cleanup removed %d stale contexts", n)
+            except Exception as e:
+                _log.warning("[LP-pool] Cleanup error: %s", e)
+    asyncio.create_task(_pool_cleanup_loop())
+
     yield  # Always yield — required by FastAPI lifespan context manager
     for email, proc in _running_processes.items():
         try:
@@ -1959,19 +1972,21 @@ async def prewarm_bulk(request: Request):
     if auth != expected:
         raise HTTPException(403, "Invalid instructor key")
     from api.backtest import prewarm_symbol, PREWARM_SYMBOLS
-    import time as _time
     results = []
     cached = fetched = errors = 0
-    t0 = _time.time()
+    t0 = time.time()
     for sym in PREWARM_SYMBOLS:
-        r = prewarm_symbol(sym, "1day")
+        # Run each prewarm in executor so it doesn't block the event loop
+        r = await asyncio.get_event_loop().run_in_executor(
+            _executor, lambda s=sym: prewarm_symbol(s, "1day")
+        )
         results.append(r)
         if r["status"] == "cached": cached += 1
         elif r["status"] == "fetched": fetched += 1
         else: errors += 1
         if r["status"] == "fetched":
-            _time.sleep(0.5)  # Rate limit protection
-    elapsed = round(_time.time() - t0, 1)
+            await asyncio.sleep(0.5)  # Rate limit protection — non-blocking
+    elapsed = round(time.time() - t0, 1)
     return {"results": results, "cached": cached, "fetched": fetched, "errors": errors, "elapsed_seconds": elapsed}
 
 
@@ -2353,7 +2368,10 @@ async def close_and_redeploy(req: DeployReq):
     close_result = {"closed": [], "failed": []}
     if open_positions:
         _log.info("[REDEPLOY] Closing %d positions before redeploy", len(open_positions))
-        close_result = _close_lp_positions(student, open_positions)
+        # Run blocking LP calls in executor so event loop stays free
+        close_result = await asyncio.get_event_loop().run_in_executor(
+            _executor, lambda: _close_lp_positions(student, open_positions)
+        )
     deploy_result = await deploy(req)
     if isinstance(deploy_result, dict):
         deploy_result["positions_closed"] = close_result["closed"]
@@ -2459,8 +2477,8 @@ async def deploy(req: DeployReq):
         _log.info("[DEPLOY] LP master PID: %s (%d strategies, 2 connections, dry_run=%s)",
                   proc.pid, len(lp_strats), dry_run)
 
-        # Wait 3 seconds to check for immediate crash
-        time.sleep(3)
+        # Wait 3 seconds to check for immediate crash (non-blocking)
+        await asyncio.sleep(3)
         exit_code = proc.poll()
         if exit_code is not None:
             del _running_processes[email]
