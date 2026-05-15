@@ -84,38 +84,49 @@ def _lp_build_config(app_key: str, app_secret: str, access_token: str):
 
 
 def get_lp_quote_ctx(app_key: str, app_secret: str, access_token: str):
-    """Return a reusable QuoteContext for these credentials."""
+    """Return a reusable QuoteContext for these credentials.
+    CRITICAL: QuoteContext() does a network handshake — MUST be built OUTSIDE
+    the lock to prevent deadlock when LP servers are slow.
+    """
     from longport.openapi import QuoteContext
     key = _lp_cred_hash(app_key, app_secret, access_token)
     now = time.time()
+    # Fast path: return cached ctx without network I/O
     with _lp_pool_lock:
         if key in _lp_quote_pool and (now - _lp_pool_last_used.get(key, 0)) < LP_POOL_TTL:
             _lp_pool_last_used[key] = now
             return _lp_quote_pool[key]
-        # Stale or absent -- drop and rebuild
-        _lp_quote_pool.pop(key, None)
-        ctx = QuoteContext(_lp_build_config(app_key, app_secret, access_token))
+        _lp_quote_pool.pop(key, None)  # evict stale
+    # Slow path: build new ctx OUTSIDE the lock (network handshake here)
+    ctx = QuoteContext(_lp_build_config(app_key, app_secret, access_token))
+    with _lp_pool_lock:
         _lp_quote_pool[key] = ctx
-        _lp_pool_last_used[key] = now
+        _lp_pool_last_used[key] = time.time()
         _log.info("[LP-pool] Created QuoteContext (quote_pool=%d)", len(_lp_quote_pool))
-        return ctx
+    return ctx
 
 
 def get_lp_trade_ctx(app_key: str, app_secret: str, access_token: str):
-    """Return a reusable TradeContext for these credentials."""
+    """Return a reusable TradeContext for these credentials.
+    CRITICAL: TradeContext() does a network handshake — MUST be built OUTSIDE
+    the lock to prevent deadlock when LP servers are slow.
+    """
     from longport.openapi import TradeContext
     key = _lp_cred_hash(app_key, app_secret, access_token) + "_trade"
     now = time.time()
+    # Fast path
     with _lp_pool_lock:
         if key in _lp_trade_pool and (now - _lp_pool_last_used.get(key, 0)) < LP_POOL_TTL:
             _lp_pool_last_used[key] = now
             return _lp_trade_pool[key]
         _lp_trade_pool.pop(key, None)
-        ctx = TradeContext(_lp_build_config(app_key, app_secret, access_token))
+    # Slow path: build OUTSIDE the lock
+    ctx = TradeContext(_lp_build_config(app_key, app_secret, access_token))
+    with _lp_pool_lock:
         _lp_trade_pool[key] = ctx
-        _lp_pool_last_used[key] = now
+        _lp_pool_last_used[key] = time.time()
         _log.info("[LP-pool] Created TradeContext (trade_pool=%d)", len(_lp_trade_pool))
-        return ctx
+    return ctx
 
 
 def cleanup_lp_pool() -> int:
@@ -405,9 +416,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="QuantX Deployer", lifespan=lifespan)
 
-from fastapi.middleware.gzip import GZipMiddleware
-app.add_middleware(GZipMiddleware, minimum_size=1000)
-
 # ── Symbol cache ────────────────────────────────────────────────────────────
 _symbol_cache: dict[str, dict] = {
     "SPY.US": {"found": True, "symbol": "SPY.US", "name": "SPDR S&P 500 ETF Trust", "exchange": "AMEX", "lot_size": 1, "currency": "USD"},
@@ -430,7 +438,7 @@ _symbol_cache: dict[str, dict] = {
     "1299.HK": {"found": True, "symbol": "1299.HK", "name": "AIA Group Limited", "exchange": "HKEX", "lot_size": 200, "currency": "HKD"},
 }
 
-_executor = ThreadPoolExecutor(max_workers=8)
+_executor = ThreadPoolExecutor(max_workers=4)
 
 static_dir = Path(__file__).parent.parent / "static"
 if static_dir.exists():
@@ -2614,45 +2622,24 @@ async def test_broker_account(account_id: int):
     broker = acct.get("broker", "")
     def _test():
         if broker == "longport":
-            from longport.openapi import QuoteContext
-            ctx = None
             try:
-                # Build a FRESH context (don't use pool) so we actually verify creds
-                cfg = _lp_build_config(acct["app_key"], acct["app_secret"], acct["access_token"])
-                ctx = QuoteContext(cfg)
+                ctx = get_lp_quote_ctx(acct["app_key"], acct["app_secret"], acct["access_token"])
                 quotes = ctx.quote(["700.HK"])
                 if quotes:
                     price = float(quotes[0].last_done)
                     update_broker_account_status(account_id, True)
-                    return {"ok": True, "message": f"Connected — 700.HK: HK${price:.2f}"}
+                    return {"ok": True, "message": f"Connected -- 700.HK: ${price:.2f}"}
                 update_broker_account_status(account_id, True)
                 return {"ok": True, "message": "Connected (no quote data)"}
             except Exception as e:
                 update_broker_account_status(account_id, False, str(e))
                 return {"ok": False, "message": str(e)}
-            finally:
-                if ctx is not None:
-                    try:
-                        del ctx
-                    except Exception:
-                        pass
         return {"ok": False, "message": f"Unknown broker: {broker}"}
-    # Use a dedicated single-thread executor with a 15s timeout so this never
-    # blocks the shared _executor (4 workers) or hangs indefinitely.
-    _test_executor = ThreadPoolExecutor(max_workers=1)
     try:
-        result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(_test_executor, _test),
-            timeout=15.0
-        )
+        result = await asyncio.get_event_loop().run_in_executor(_executor, _test)
         return result
-    except asyncio.TimeoutError:
-        update_broker_account_status(account_id, False, "Connection timed out after 15s")
-        return {"ok": False, "message": "Connection timed out after 15s — check your App Key / Secret / Token"}
     except Exception as e:
         return {"ok": False, "message": f"Test error: {e}"}
-    finally:
-        _test_executor.shutdown(wait=False)
 
 
 # ── Data cache endpoints ─────────────────────────────────────────────────────
