@@ -2331,6 +2331,7 @@ async function libRunOptimize() {
   const paramGrid = _libOptBuildParamGrid();
   const included = _libOptParams.filter(p => p.include);
   if (!included.length) { showToast('Select at least one parameter to optimize', 'error'); return; }
+  // Combo count guard
   let total = 1;
   Object.values(paramGrid).forEach(vals => { total *= vals.length; });
   if (total > 2000) {
@@ -2345,87 +2346,30 @@ async function libRunOptimize() {
   const progMsg = document.getElementById('bt-opt-progress-msg');
   btn.disabled = true; btn.textContent = 'Running...';
   prog.style.display = 'flex';
-  prog.style.flexDirection = 'column';
-  prog.style.gap = '6px';
   document.getElementById('bt-opt-results').style.display = 'none';
-
-  // Inject progress bar into the progress div (once)
-  if (!document.getElementById('bt-opt-bar-wrap')) {
-    const barWrap = document.createElement('div');
-    barWrap.id = 'bt-opt-bar-wrap';
-    barWrap.style.cssText = 'width:100%;height:6px;background:#DDD6FE;border-radius:3px;overflow:hidden';
-    barWrap.innerHTML = '<div id="bt-opt-bar-fill" style="height:100%;width:0%;background:#5B21B6;border-radius:3px;transition:width .4s"></div>';
-    const countRow = document.createElement('div');
-    countRow.style.cssText = 'display:flex;justify-content:space-between;font-size:11px;color:#5B21B6';
-    countRow.innerHTML = '<span id="bt-opt-count-left"></span><span id="bt-opt-count-right"></span>';
-    prog.appendChild(barWrap);
-    prog.appendChild(countRow);
-  }
-  if (progMsg) progMsg.textContent = 'Fetching price data...';
-  const setProgress = (done, tot, msg) => {
-    const pct = tot > 0 ? Math.round(done / tot * 100) : 0;
-    const fill = document.getElementById('bt-opt-bar-fill');
-    if (fill) fill.style.width = pct + '%';
-    const left = document.getElementById('bt-opt-count-left');
-    const right = document.getElementById('bt-opt-count-right');
-    if (left) left.textContent = tot > 0 ? `${done.toLocaleString()} / ${tot.toLocaleString()}` : '';
-    if (right) right.textContent = '';
-    if (progMsg && msg) progMsg.textContent = msg;
-  };
-
+  const msgs = ['Fetching price data...','Running combinations...','Validating walk-forward...','Running Monte Carlo...','Ranking results...'];
+  let mi = 0;
+  if (progMsg) progMsg.textContent = msgs[0];
+  const msgInt = setInterval(() => { mi = (mi+1) % msgs.length; if (progMsg) progMsg.textContent = msgs[mi]; }, 3000);
   try {
-    const resp = await fetch(API + '/api/backtest/optimize-stream-lib', {
+    const r = await fetch(API + '/api/backtest/optimize', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({
         symbol: sym, timeframe: tf, strategy: strat,
         param_grid: paramGrid, initial_capital: cap,
         limit: _btLimit, commission_pct: commPct, slippage_pct: slipPct,
         enable_walk_forward: enableWF, enable_monte_carlo: enableMC,
-        email: EMAIL || '',
       })
     });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({detail:'Optimization failed'}));
-      throw new Error(err.detail || 'Optimization failed');
-    }
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '', lastData = null;
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf('\n\n')) !== -1) {
-        const frame = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        const line = frame.split('\n').find(l => l.startsWith('data:'));
-        if (!line) continue;
-        let evt;
-        try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
-        if (evt.type === 'progress') {
-          setProgress(evt.done || 0, evt.total || total, evt.message || null);
-        } else if (evt.type === 'complete') {
-          lastData = evt;
-          setProgress(evt.total_results || total, evt.total_results || total, evt.message || 'Done!');
-        } else if (evt.type === 'start') {
-          setProgress(0, evt.total || total, evt.message || 'Starting...');
-        } else if (evt.type === 'error') {
-          throw new Error(evt.message || 'Optimization error');
-        }
-      }
-    }
-    if (lastData && lastData.results) {
-      _libOptRenderResults({results: lastData.results, total_combinations: lastData.total_results || total}, enableWF, enableMC);
-    } else {
-      showToast('Optimization returned no results', 'warning');
-    }
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'Optimization failed');
+    _libOptRenderResults(d, enableWF, enableMC);
   } catch(e) {
     showToast('Optimization error: ' + e.message, 'error');
   } finally {
+    clearInterval(msgInt);
     prog.style.display = 'none';
     btn.disabled = false; btn.textContent = 'Run Optimization';
-    setProgress(0, 0, 'Running combinations...');
   }
 }
 
@@ -2434,52 +2378,80 @@ function _libOptRenderResults(data, showWF, showMC) {
   const resEl = document.getElementById('bt-opt-results');
   const table = document.getElementById('bt-opt-table');
   if (!results.length) { resEl.style.display = ''; table.innerHTML = '<tr><td style="padding:12px;color:var(--text-muted)">No results returned.</td></tr>'; return; }
-  const strat = document.getElementById('bt-strategy').value;
   const mf = (v, dec=1) => v !== undefined && v !== null ? (typeof v === 'number' ? v.toFixed(dec) : v) : '—';
   const wfBadge = wf => wf?.pass ? '<span style="background:#DCFCE7;color:#166534;padding:1px 6px;border-radius:4px;font-size:10px">✓ PASS</span>' : '<span style="background:#FEE2E2;color:#991B1B;padding:1px 6px;border-radius:4px;font-size:10px">✗ FAIL</span>';
   const mcBadge = mc => mc?.pass ? '<span style="background:#DCFCE7;color:#166534;padding:1px 6px;border-radius:4px;font-size:10px">✓ PASS</span>' : '<span style="background:#FEE2E2;color:#991B1B;padding:1px 6px;border-radius:4px;font-size:10px">✗ FAIL</span>';
-  // Build header
   const paramKeys = Object.keys(results[0].params || {});
-  let thead = '<thead><tr style="background:var(--surface-2);font-size:11px;color:var(--text-secondary)">';
-  thead += '<th style="padding:6px 8px;text-align:left">#</th>';
-  paramKeys.forEach(k => {
-    const meta = PARAM_META[k] || {};
-    thead += `<th style="padding:6px 8px">${esc(meta.label || k)}</th>`;
-  });
-  thead += '<th style="padding:6px 8px">Return</th><th style="padding:6px 8px">Sharpe</th><th style="padding:6px 8px">Max DD</th><th style="padding:6px 8px">Win Rate</th><th style="padding:6px 8px">Trades</th>';
-  if (showWF) thead += '<th style="padding:6px 8px">Walk-Fwd</th>';
-  if (showMC) thead += '<th style="padding:6px 8px">Monte Carlo</th>';
-  thead += '<th style="padding:6px 8px">Load</th>';
-  thead += '</tr></thead>';
-  // Build rows (top 20)
-  let tbody = '<tbody>';
-  results.slice(0, 20).forEach((r, i) => {
-    const m = r.metrics || {};
-    const ret = parseFloat(m.total_return_pct || 0);
-    const retColor = ret >= 0 ? 'color:#16A34A' : 'color:#DC2626';
-    const rowBg = i === 0 ? 'background:#F5F3FF' : (i % 2 === 0 ? 'background:var(--surface)' : '');
-    tbody += `<tr style="${rowBg};border-bottom:1px solid var(--border)">`;
-    tbody += `<td style="padding:5px 8px;font-weight:600;color:var(--text-muted)">${i+1}</td>`;
-    paramKeys.forEach(k => {
-      const meta = PARAM_META[k] || { type: 'float' };
-      const v = r.params[k];
-      tbody += `<td style="padding:5px 8px;text-align:center;font-weight:500">${meta.type==='int' ? v : parseFloat(v).toFixed(2)}</td>`;
+  let _sk = null, _sd = -1; // sort key, sort direction
+
+  const _sorted = () => {
+    if (!_sk) return results;
+    return [...results].sort((a, b) => {
+      const av = _sk === 'return' ? (a.metrics?.total_return_pct||0)
+               : _sk === 'sharpe'  ? (a.metrics?.sharpe_ratio||0)
+               : _sk === 'maxdd'   ? (a.metrics?.max_drawdown_pct||0)
+               : _sk === 'winrate' ? (a.metrics?.win_rate_pct||0)
+               : _sk === 'trades'  ? (a.metrics?.total_trades||0)
+               : (a.params[_sk]||0);
+      const bv = _sk === 'return' ? (b.metrics?.total_return_pct||0)
+               : _sk === 'sharpe'  ? (b.metrics?.sharpe_ratio||0)
+               : _sk === 'maxdd'   ? (b.metrics?.max_drawdown_pct||0)
+               : _sk === 'winrate' ? (b.metrics?.win_rate_pct||0)
+               : _sk === 'trades'  ? (b.metrics?.total_trades||0)
+               : (b.params[_sk]||0);
+      return (av - bv) * _sd;
     });
-    tbody += `<td style="padding:5px 8px;text-align:center;${retColor};font-weight:500">${mf(ret)}%</td>`;
-    tbody += `<td style="padding:5px 8px;text-align:center">${mf(m.sharpe_ratio, 2)}</td>`;
-    tbody += `<td style="padding:5px 8px;text-align:center;color:#DC2626">${mf(m.max_drawdown_pct)}%</td>`;
-    tbody += `<td style="padding:5px 8px;text-align:center">${mf(m.win_rate_pct)}%</td>`;
-    tbody += `<td style="padding:5px 8px;text-align:center">${m.total_trades || '—'}</td>`;
-    if (showWF) tbody += `<td style="padding:5px 8px;text-align:center">${wfBadge(r.walk_forward)}</td>`;
-    if (showMC) tbody += `<td style="padding:5px 8px;text-align:center">${mcBadge(r.monte_carlo)}</td>`;
-    tbody += `<td style="padding:5px 8px;text-align:center"><button onclick="libOptLoadParams(${JSON.stringify(JSON.stringify(r.params))})" style="padding:3px 10px;background:#5B21B6;color:#fff;border:none;border-radius:4px;font-size:11px;cursor:pointer">Load</button></td>`;
-    tbody += '</tr>';
-  });
-  tbody += '</tbody>';
-  table.innerHTML = thead + tbody;
+  };
+
+  const ths = 'padding:6px 8px;cursor:pointer;user-select:none;white-space:nowrap;';
+  const si = k => _sk===k ? (_sd===-1?'▼':'▲') : '⇅';
+
+  const render = () => {
+    const sorted = _sorted();
+    let thead = `<thead><tr style="background:var(--surface-2);font-size:11px;color:var(--text-secondary)">`;
+    thead += `<th style="${ths}">#</th>`;
+    paramKeys.forEach(k => {
+      const meta = PARAM_META[k] || {};
+      thead += `<th style="${ths}" onclick="window._lOSort('${k}')">${esc(meta.label||k)} ${si(k)}</th>`;
+    });
+    [['return','Return'],['sharpe','Sharpe'],['maxdd','Max DD'],['winrate','Win Rate'],['trades','Trades']].forEach(([k,lbl]) => {
+      thead += `<th style="${ths}" onclick="window._lOSort('${k}')">${lbl} ${si(k)}</th>`;
+    });
+    if (showWF) thead += `<th style="${ths}">Walk-Fwd</th>`;
+    if (showMC) thead += `<th style="${ths}">Monte Carlo</th>`;
+    thead += `<th style="${ths}">Load</th></tr></thead>`;
+
+    let tbody = '<tbody>';
+    sorted.slice(0, 20).forEach((r, i) => {
+      const m = r.metrics || {};
+      const ret = parseFloat(m.total_return_pct || 0);
+      const retColor = ret >= 0 ? 'color:#16A34A' : 'color:#DC2626';
+      const rowBg = i === 0 ? 'background:#F5F3FF' : (i % 2 === 0 ? 'background:var(--surface)' : '');
+      tbody += `<tr style="${rowBg};border-bottom:1px solid var(--border)">`;
+      tbody += `<td style="padding:5px 8px;font-weight:600;color:var(--text-muted)">${i+1}</td>`;
+      paramKeys.forEach(k => {
+        const meta = PARAM_META[k] || { type: 'float' };
+        const v = r.params[k];
+        tbody += `<td style="padding:5px 8px;text-align:center;font-weight:500">${meta.type==='int' ? v : parseFloat(v).toFixed(2)}</td>`;
+      });
+      tbody += `<td style="padding:5px 8px;text-align:center;${retColor};font-weight:500">${mf(ret)}%</td>`;
+      tbody += `<td style="padding:5px 8px;text-align:center">${mf(m.sharpe_ratio,2)}</td>`;
+      tbody += `<td style="padding:5px 8px;text-align:center;color:#DC2626">${mf(m.max_drawdown_pct)}%</td>`;
+      tbody += `<td style="padding:5px 8px;text-align:center">${mf(m.win_rate_pct)}%</td>`;
+      tbody += `<td style="padding:5px 8px;text-align:center">${m.total_trades||'—'}</td>`;
+      if (showWF) tbody += `<td style="padding:5px 8px;text-align:center">${wfBadge(r.walk_forward)}</td>`;
+      if (showMC) tbody += `<td style="padding:5px 8px;text-align:center">${mcBadge(r.monte_carlo)}</td>`;
+      tbody += `<td style="padding:5px 8px;text-align:center"><button onclick="libOptLoadParams(${JSON.stringify(r.params)})" style="padding:3px 10px;background:#5B21B6;color:#fff;border:none;border-radius:4px;font-size:11px;cursor:pointer">Load</button></td>`;
+      tbody += '</tr>';
+    });
+    table.innerHTML = thead + tbody + '</tbody>';
+  };
+
+  window._lOSort = k => { _sd = _sk===k ? _sd*-1 : -1; _sk=k; render(); };
+  render();
+
   const summary = `Tested ${data.total_combinations} combinations · Best: ${mf(results[0]?.metrics?.total_return_pct)}% return, Sharpe ${mf(results[0]?.metrics?.sharpe_ratio, 2)}`;
   resEl.style.display = '';
-  // Add summary line
   const existing = document.getElementById('bt-opt-summary');
   if (existing) existing.remove();
   const summaryEl = document.createElement('div');
@@ -2489,20 +2461,28 @@ function _libOptRenderResults(data, showWF, showMC) {
   resEl.insertBefore(summaryEl, resEl.querySelector('div'));
 }
 
-function libOptLoadParams(paramsJson) {
+function libOptLoadParams(params) {
   try {
-    const params = JSON.parse(paramsJson);
+    // params may arrive as object (from onclick attr) or JSON string
+    if (typeof params === 'string') params = JSON.parse(params);
+    let loaded = 0;
     Object.entries(params).forEach(([key, val]) => {
       const el = document.getElementById(`bt-param-${key}`);
-      if (el) el.value = val;
-      // Also update _libOptParams current values
+      if (el) { el.value = val; loaded++; }
+      // Also update _libOptParams current values for display
       const p = _libOptParams.find(p => p.key === key);
       if (p) p.current = val;
     });
-    showToast('Parameters loaded — click Run Backtest to verify', 'success');
-    // Scroll up to params
-    document.getElementById('bt-params-container')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  } catch(e) { showToast('Failed to load params', 'error'); }
+    if (loaded === 0) {
+      showToast('Could not find param inputs — try clicking Library tab first', 'warning');
+      return;
+    }
+    showToast(`Loaded ${loaded} parameters — click Run Backtest`, 'success');
+    // Scroll to Run Backtest button
+    const runBtn = document.querySelector('button[onclick*="btRun"], #bt-run-btn, button.btn-primary');
+    if (runBtn) runBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    else document.getElementById('bt-params-container')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch(e) { showToast('Failed to load params: ' + e.message, 'error'); }
 }
 
 // ── Bot Settings: load params for current bot ──────────────────────────────
@@ -3876,13 +3856,6 @@ function _monthsLabel(m) {
   return Math.round(m) + 'mo';
 }
 
-// Bars-per-day multiplier for intraday timeframes.
-// Period pills are defined in daily bars; multiply to get correct intraday limit.
-function _intradayMultiplier(tf) {
-  const m = {'1min':390,'5min':78,'15min':26,'30min':13,'1hour':7,'4hour':2,'1day':1,'1week':1};
-  return m[tf] || 1;
-}
-
 function updatePeriodPills() {
   const broker = _btBroker;
   const tf = getBtTimeframe();
@@ -3890,15 +3863,13 @@ function updatePeriodPills() {
   const depth = src[tf] || src['1day'];
   const container = document.getElementById('bt-period-pills');
   if (!container) return;
-  const mult = _intradayMultiplier(tf);
 
   let bestEnabled = null;
   const pills = PERIOD_DEFS.map(p => {
     const enabled = p.months === 0 || depth.months >= p.months;
     if (enabled && p.key !== 'Max') bestEnabled = p;
     const label = p.key === 'Max' ? 'Max (' + _monthsLabel(depth.months) + ')' : p.key;
-    // Scale daily bar count by intraday multiplier so server fetches the right amount
-    const limit = p.key === 'Max' ? depth.bars : p.bars * mult;
+    const limit = p.key === 'Max' ? depth.bars : p.bars;
     const cls = enabled ? 'filter-pill has-data' : 'filter-pill disabled';
     const tip = enabled ? '' : ' title="Only ' + depth.label + ' available for this timeframe"';
     return {html: '<span class="' + cls + '" data-limit="' + limit + '"' + tip
@@ -3909,8 +3880,8 @@ function updatePeriodPills() {
 
   // Auto-select largest enabled non-Max
   if (bestEnabled) {
-    _btLimit = bestEnabled.bars * mult;
-    const active = container.querySelector('[data-limit="' + bestEnabled.bars * mult + '"]');
+    _btLimit = bestEnabled.bars;
+    const active = container.querySelector('[data-limit="' + bestEnabled.bars + '"]');
     if (active) active.classList.add('active');
   } else {
     // Only Max available
