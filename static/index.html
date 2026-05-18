@@ -2378,90 +2378,52 @@ function _libOptRenderResults(data, showWF, showMC) {
   const resEl = document.getElementById('bt-opt-results');
   const table = document.getElementById('bt-opt-table');
   if (!results.length) { resEl.style.display = ''; table.innerHTML = '<tr><td style="padding:12px;color:var(--text-muted)">No results returned.</td></tr>'; return; }
+  const strat = document.getElementById('bt-strategy').value;
   const mf = (v, dec=1) => v !== undefined && v !== null ? (typeof v === 'number' ? v.toFixed(dec) : v) : '—';
   const wfBadge = wf => wf?.pass ? '<span style="background:#DCFCE7;color:#166534;padding:1px 6px;border-radius:4px;font-size:10px">✓ PASS</span>' : '<span style="background:#FEE2E2;color:#991B1B;padding:1px 6px;border-radius:4px;font-size:10px">✗ FAIL</span>';
   const mcBadge = mc => mc?.pass ? '<span style="background:#DCFCE7;color:#166534;padding:1px 6px;border-radius:4px;font-size:10px">✓ PASS</span>' : '<span style="background:#FEE2E2;color:#991B1B;padding:1px 6px;border-radius:4px;font-size:10px">✗ FAIL</span>';
+  // Build header
   const paramKeys = Object.keys(results[0].params || {});
-  let _sk = null, _sd = -1; // sort key, sort direction
-
-  const _sorted = () => {
-    if (!_sk) return results;
-    return [...results].sort((a, b) => {
-      const av = _sk === 'return' ? (a.metrics?.total_return_pct||0)
-               : _sk === 'sharpe'  ? (a.metrics?.sharpe_ratio||0)
-               : _sk === 'maxdd'   ? (a.metrics?.max_drawdown_pct||0)
-               : _sk === 'winrate' ? (a.metrics?.win_rate_pct||0)
-               : _sk === 'trades'  ? (a.metrics?.total_trades||0)
-               : (a.params[_sk]||0);
-      const bv = _sk === 'return' ? (b.metrics?.total_return_pct||0)
-               : _sk === 'sharpe'  ? (b.metrics?.sharpe_ratio||0)
-               : _sk === 'maxdd'   ? (b.metrics?.max_drawdown_pct||0)
-               : _sk === 'winrate' ? (b.metrics?.win_rate_pct||0)
-               : _sk === 'trades'  ? (b.metrics?.total_trades||0)
-               : (b.params[_sk]||0);
-      return (av - bv) * _sd;
-    });
-  };
-
-  const ths = 'padding:6px 8px;cursor:pointer;user-select:none;white-space:nowrap;';
-  const si = k => _sk===k ? (_sd===-1?'▼':'▲') : '⇅';
-
-  const render = () => {
-    const sorted = _sorted();
-    let thead = `<thead><tr style="background:var(--surface-2);font-size:11px;color:var(--text-secondary)">`;
-    thead += `<th style="${ths}">#</th>`;
-    paramKeys.forEach(k => {
-      const meta = PARAM_META[k] || {};
-      thead += `<th style="${ths}" onclick="window._lOSort('${k}')">${esc(meta.label||k)} ${si(k)}</th>`;
-    });
-    [['return','Return'],['sharpe','Sharpe'],['maxdd','Max DD'],['winrate','Win Rate'],['trades','Trades']].forEach(([k,lbl]) => {
-      thead += `<th style="${ths}" onclick="window._lOSort('${k}')">${lbl} ${si(k)}</th>`;
-    });
-    if (showWF) thead += `<th style="${ths}">Walk-Fwd</th>`;
-    if (showMC) thead += `<th style="${ths}">Monte Carlo</th>`;
-    thead += `<th style="${ths}">Load</th></tr></thead>`;
-
-    let tbody = '<tbody>';
-    sorted.slice(0, 20).forEach((r, i) => {
-      const m = r.metrics || {};
-      const ret = parseFloat(m.total_return_pct || 0);
-      const retColor = ret >= 0 ? 'color:#16A34A' : 'color:#DC2626';
-      const rowBg = i === 0 ? 'background:#F5F3FF' : (i % 2 === 0 ? 'background:var(--surface)' : '');
-      tbody += `<tr style="${rowBg};border-bottom:1px solid var(--border)">`;
-      tbody += `<td style="padding:5px 8px;font-weight:600;color:var(--text-muted)">${i+1}</td>`;
-      paramKeys.forEach(k => {
-        const meta = PARAM_META[k] || { type: 'float' };
-        const v = r.params[k];
-        tbody += `<td style="padding:5px 8px;text-align:center;font-weight:500">${meta.type==='int' ? v : parseFloat(v).toFixed(2)}</td>`;
-      });
-      tbody += `<td style="padding:5px 8px;text-align:center;${retColor};font-weight:500">${mf(ret)}%</td>`;
-      tbody += `<td style="padding:5px 8px;text-align:center">${mf(m.sharpe_ratio,2)}</td>`;
-      tbody += `<td style="padding:5px 8px;text-align:center;color:#DC2626">${mf(m.max_drawdown_pct)}%</td>`;
-      tbody += `<td style="padding:5px 8px;text-align:center">${mf(m.win_rate_pct)}%</td>`;
-      tbody += `<td style="padding:5px 8px;text-align:center">${m.total_trades||'—'}</td>`;
-      if (showWF) tbody += `<td style="padding:5px 8px;text-align:center">${wfBadge(r.walk_forward)}</td>`;
-      if (showMC) tbody += `<td style="padding:5px 8px;text-align:center">${mcBadge(r.monte_carlo)}</td>`;
-      tbody += `<td style="padding:5px 8px;text-align:center"><button class="bt-opt-load-btn" data-params='${JSON.stringify(r.params).replace(/'/g, "&#39;")}' style="padding:3px 10px;background:#5B21B6;color:#fff;border:none;border-radius:4px;font-size:11px;cursor:pointer">Load</button></td>`;
-      tbody += '</tr>';
-    });
-    table.innerHTML = thead + tbody + '</tbody>';
-  };
-
-  window._lOSort = k => { _sd = _sk===k ? _sd*-1 : -1; _sk=k; render(); };
-  render();
-
-  // Delegated handler for Load buttons — avoids JSON/quote escaping in onclick attr
-  table.addEventListener('click', e => {
-    const btn = e.target.closest('.bt-opt-load-btn');
-    if (!btn) return;
-    try {
-      const params = JSON.parse(btn.dataset.params);
-      libOptLoadParams(params);
-    } catch(err) { showToast('Failed to load params', 'error'); }
+  let thead = '<thead><tr style="background:var(--surface-2);font-size:11px;color:var(--text-secondary)">';
+  thead += '<th style="padding:6px 8px;text-align:left">#</th>';
+  paramKeys.forEach(k => {
+    const meta = PARAM_META[k] || {};
+    thead += `<th style="padding:6px 8px">${esc(meta.label || k)}</th>`;
   });
-
+  thead += '<th style="padding:6px 8px">Return</th><th style="padding:6px 8px">Sharpe</th><th style="padding:6px 8px">Max DD</th><th style="padding:6px 8px">Win Rate</th><th style="padding:6px 8px">Trades</th>';
+  if (showWF) thead += '<th style="padding:6px 8px">Walk-Fwd</th>';
+  if (showMC) thead += '<th style="padding:6px 8px">Monte Carlo</th>';
+  thead += '<th style="padding:6px 8px">Load</th>';
+  thead += '</tr></thead>';
+  // Build rows (top 20)
+  let tbody = '<tbody>';
+  results.slice(0, 20).forEach((r, i) => {
+    const m = r.metrics || {};
+    const ret = parseFloat(m.total_return_pct || 0);
+    const retColor = ret >= 0 ? 'color:#16A34A' : 'color:#DC2626';
+    const rowBg = i === 0 ? 'background:#F5F3FF' : (i % 2 === 0 ? 'background:var(--surface)' : '');
+    tbody += `<tr style="${rowBg};border-bottom:1px solid var(--border)">`;
+    tbody += `<td style="padding:5px 8px;font-weight:600;color:var(--text-muted)">${i+1}</td>`;
+    paramKeys.forEach(k => {
+      const meta = PARAM_META[k] || { type: 'float' };
+      const v = r.params[k];
+      tbody += `<td style="padding:5px 8px;text-align:center;font-weight:500">${meta.type==='int' ? v : parseFloat(v).toFixed(2)}</td>`;
+    });
+    tbody += `<td style="padding:5px 8px;text-align:center;${retColor};font-weight:500">${mf(ret)}%</td>`;
+    tbody += `<td style="padding:5px 8px;text-align:center">${mf(m.sharpe_ratio, 2)}</td>`;
+    tbody += `<td style="padding:5px 8px;text-align:center;color:#DC2626">${mf(m.max_drawdown_pct)}%</td>`;
+    tbody += `<td style="padding:5px 8px;text-align:center">${mf(m.win_rate_pct)}%</td>`;
+    tbody += `<td style="padding:5px 8px;text-align:center">${m.total_trades || '—'}</td>`;
+    if (showWF) tbody += `<td style="padding:5px 8px;text-align:center">${wfBadge(r.walk_forward)}</td>`;
+    if (showMC) tbody += `<td style="padding:5px 8px;text-align:center">${mcBadge(r.monte_carlo)}</td>`;
+    tbody += `<td style="padding:5px 8px;text-align:center"><button onclick="libOptLoadParams(${JSON.stringify(JSON.stringify(r.params))})" style="padding:3px 10px;background:#5B21B6;color:#fff;border:none;border-radius:4px;font-size:11px;cursor:pointer">Load</button></td>`;
+    tbody += '</tr>';
+  });
+  tbody += '</tbody>';
+  table.innerHTML = thead + tbody;
   const summary = `Tested ${data.total_combinations} combinations · Best: ${mf(results[0]?.metrics?.total_return_pct)}% return, Sharpe ${mf(results[0]?.metrics?.sharpe_ratio, 2)}`;
   resEl.style.display = '';
+  // Add summary line
   const existing = document.getElementById('bt-opt-summary');
   if (existing) existing.remove();
   const summaryEl = document.createElement('div');
@@ -2471,28 +2433,20 @@ function _libOptRenderResults(data, showWF, showMC) {
   resEl.insertBefore(summaryEl, resEl.querySelector('div'));
 }
 
-function libOptLoadParams(params) {
+function libOptLoadParams(paramsJson) {
   try {
-    // params may arrive as object (from onclick attr) or JSON string
-    if (typeof params === 'string') params = JSON.parse(params);
-    let loaded = 0;
+    const params = JSON.parse(paramsJson);
     Object.entries(params).forEach(([key, val]) => {
       const el = document.getElementById(`bt-param-${key}`);
-      if (el) { el.value = val; loaded++; }
-      // Also update _libOptParams current values for display
+      if (el) el.value = val;
+      // Also update _libOptParams current values
       const p = _libOptParams.find(p => p.key === key);
       if (p) p.current = val;
     });
-    if (loaded === 0) {
-      showToast('Could not find param inputs — try clicking Library tab first', 'warning');
-      return;
-    }
-    showToast(`Loaded ${loaded} parameters — click Run Backtest`, 'success');
-    // Scroll to Run Backtest button
-    const runBtn = document.querySelector('button[onclick*="btRun"], #bt-run-btn, button.btn-primary');
-    if (runBtn) runBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    else document.getElementById('bt-params-container')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  } catch(e) { showToast('Failed to load params: ' + e.message, 'error'); }
+    showToast('Parameters loaded — click Run Backtest to verify', 'success');
+    // Scroll up to params
+    document.getElementById('bt-params-container')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch(e) { showToast('Failed to load params', 'error'); }
 }
 
 // ── Bot Settings: load params for current bot ──────────────────────────────
@@ -3198,7 +3152,7 @@ async function createBot(andDeploy = false) {
     if (andDeploy) {
       try {
         await fetch(API + '/api/strategy/' + encodeURIComponent(sid) + '/toggle?active=true', { method: 'PUT' });
-        const dr = await fetch(API + '/api/deploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL }) });
+        const dr = await fetch(API + '/api/deploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL, dry_run: isDryRun }) });
         const dd = await dr.json();
         if (!dr.ok) { showToast('Created but deploy failed: ' + (dd.detail || ''), 'error'); }
         else { BOT_RUNNING = true; showToast('Bot deployed: ' + name, 'success'); }

@@ -182,7 +182,7 @@ class ValidateScriptReq(BaseModel):
 
 class DeployReq(BaseModel):
     email: str
-    dry_run: bool = False
+    dry_run: Optional[bool] = None  # None = use strategy flags; True/False = explicit override
 
 
 class StopReq(BaseModel):
@@ -411,19 +411,6 @@ async def lifespan(app: FastAPI):
     if HOSTING == "railway":
         threading.Thread(target=_orchestrator_loop, daemon=True, name="orchestrator").start()
         _log.info("[ORCH] Orchestrator thread started (Railway mode)")
-
-    # Schedule LP pool cleanup every 5 minutes
-    async def _pool_cleanup_loop():
-        while True:
-            await asyncio.sleep(300)
-            try:
-                n = cleanup_lp_pool()
-                if n:
-                    _log.info("[LP-pool] Periodic cleanup removed %d stale contexts", n)
-            except Exception as e:
-                _log.warning("[LP-pool] Cleanup error: %s", e)
-    asyncio.create_task(_pool_cleanup_loop())
-
     yield  # Always yield — required by FastAPI lifespan context manager
     for email, proc in _running_processes.items():
         try:
@@ -1639,12 +1626,7 @@ async def deploy_options_bot(request: Request):
     }
 
     # Generate + save the bot script under bots/<email>/bot_<symbol>_<strat>_<dte>DTE.py
-    try:
-        from api.generate import save_lp_options_bot
-    except ImportError:
-        # save_lp_options_bot not yet implemented in generate.py — return clear error
-        raise HTTPException(501, "Options bot deployment is not yet available. "
-                            "save_lp_options_bot is not implemented in api/generate.py.")
+    from api.generate import save_lp_options_bot
     from api.config import BOTS_DIR as _BOTS_DIR
     output_dir = _BOTS_DIR / email
     try:
@@ -1977,21 +1959,19 @@ async def prewarm_bulk(request: Request):
     if auth != expected:
         raise HTTPException(403, "Invalid instructor key")
     from api.backtest import prewarm_symbol, PREWARM_SYMBOLS
+    import time as _time
     results = []
     cached = fetched = errors = 0
-    t0 = time.time()
+    t0 = _time.time()
     for sym in PREWARM_SYMBOLS:
-        # Run blocking prewarm in executor so event loop stays free
-        r = await asyncio.get_event_loop().run_in_executor(
-            _executor, lambda s=sym: prewarm_symbol(s, "1day")
-        )
+        r = prewarm_symbol(sym, "1day")
         results.append(r)
         if r["status"] == "cached": cached += 1
         elif r["status"] == "fetched": fetched += 1
         else: errors += 1
         if r["status"] == "fetched":
-            await asyncio.sleep(0.5)  # Rate limit protection — non-blocking
-    elapsed = round(time.time() - t0, 1)
+            _time.sleep(0.5)  # Rate limit protection
+    elapsed = round(_time.time() - t0, 1)
     return {"results": results, "cached": cached, "fetched": fetched, "errors": errors, "elapsed_seconds": elapsed}
 
 
@@ -2373,9 +2353,7 @@ async def close_and_redeploy(req: DeployReq):
     close_result = {"closed": [], "failed": []}
     if open_positions:
         _log.info("[REDEPLOY] Closing %d positions before redeploy", len(open_positions))
-        close_result = await asyncio.get_event_loop().run_in_executor(
-            _executor, lambda: _close_lp_positions(student, open_positions)
-        )
+        close_result = _close_lp_positions(student, open_positions)
     deploy_result = await deploy(req)
     if isinstance(deploy_result, dict):
         deploy_result["positions_closed"] = close_result["closed"]
@@ -2458,11 +2436,19 @@ async def deploy(req: DeployReq):
     for pos in read_open_positions(email):
         existing_states[pos["strategy_id"]] = pos
 
-    dry_run = bool(getattr(req, "dry_run", False))
-    # If request didn't set dry_run, fall back to any active strategy's is_dry_run flag
-    if not dry_run:
-        if any(s.get("is_dry_run") for s in lp_strats):
-            dry_run = True
+    # dry_run precedence:
+    # 1. Explicit req.dry_run=True → always dry run
+    # 2. Explicit req.dry_run=False (user chose Live) → respect it, don't override
+    # 3. req.dry_run not set → fall back to strategy flags (any is_dry_run → dry)
+    req_dry_run = getattr(req, "dry_run", None)
+    if req_dry_run is True:
+        dry_run = True
+    elif req_dry_run is False:
+        # User explicitly chose Live — respect it even if some strategies have is_dry_run=True
+        dry_run = False
+    else:
+        # Not specified — use strategy-level flags
+        dry_run = any(s.get("is_dry_run") for s in lp_strats)
     try:
         script_path, log_path = generate_lp_master_bot(
             email, lp_strats, lp_creds, dry_run=dry_run)
@@ -2481,8 +2467,8 @@ async def deploy(req: DeployReq):
         _log.info("[DEPLOY] LP master PID: %s (%d strategies, 2 connections, dry_run=%s)",
                   proc.pid, len(lp_strats), dry_run)
 
-        # Wait 3 seconds to check for immediate crash (non-blocking)
-        await asyncio.sleep(3)
+        # Wait 3 seconds to check for immediate crash
+        time.sleep(3)
         exit_code = proc.poll()
         if exit_code is not None:
             del _running_processes[email]
