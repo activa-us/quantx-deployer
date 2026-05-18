@@ -387,7 +387,7 @@ def get_strategies(email: str, active_only: bool = False) -> list[dict]:
                 "library_id": r["library_id"] if "library_id" in rk else "",
                 "custom_script": r["custom_script"] if "custom_script" in rk else "",
                 "broker": r["broker"] if "broker" in rk else "longport",
-                "is_dry_run": bool(r["is_dry_run"]) if "is_dry_run" in rk else False,
+                "is_dry_run": (int(r["is_dry_run"]) != 0) if "is_dry_run" in rk and r["is_dry_run"] is not None else False,
                 "allocation": float(r["allocation"]) if "allocation" in rk and r["allocation"] else 10000,
                 "backtest_results": json.loads(r["backtest_results_json"]) if "backtest_results_json" in rk and r["backtest_results_json"] else None,
                 "live_results": json.loads(r["live_results_json"]) if "live_results_json" in rk and r["live_results_json"] else None,
