@@ -20,9 +20,39 @@ from typing import Optional
 import bcrypt
 import jwt
 
-# In local/dev mode without a JWT_SECRET, generate one per-process so tokens
-# at least work within a single run. Set JWT_SECRET in env for production.
-JWT_SECRET = os.environ.get("JWT_SECRET") or secrets.token_hex(32)
+# JWT_SECRET must be stable across restarts so existing tokens stay valid.
+# Priority: (1) JWT_SECRET env var — always set this in production
+#           (2) Derived from the Fernet key file — stable per-machine fallback
+#           (3) Last resort: random (tokens invalidated on restart — dev only)
+def _get_stable_secret() -> str:
+    env_secret = os.environ.get("JWT_SECRET", "")
+    if env_secret:
+        return env_secret
+    # Derive from Fernet key file so secret survives restarts on same machine
+    try:
+        from pathlib import Path
+        key_candidates = [
+            Path(os.environ.get("DATA_DIR", "/data")) / "fernet.key",
+            Path(__file__).parent.parent / "data" / "fernet.key",
+            Path(__file__).parent.parent / "fernet.key",
+        ]
+        for p in key_candidates:
+            if p.exists():
+                import hashlib
+                raw = p.read_bytes()
+                return hashlib.sha256(b"jwt:" + raw).hexdigest()
+    except Exception:
+        pass
+    # Dev fallback — not stable across restarts, but acceptable locally
+    import logging
+    logging.getLogger("quantx-deployer").warning(
+        "JWT_SECRET not set and no Fernet key found — using ephemeral secret. "
+        "Students will be logged out on restart. Set JWT_SECRET in .env."
+    )
+    return secrets.token_hex(32)
+
+
+JWT_SECRET = _get_stable_secret()
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24 * 7  # 1 week
 
