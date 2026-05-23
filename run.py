@@ -52,16 +52,18 @@ def main():
     dev_mode = os.environ.get("DEV_MODE", "0") == "1"
     python = sys.executable
     host = "0.0.0.0" if is_railway else "127.0.0.1"
-    cmd = [python, "-m", "uvicorn", "api.main:app",
-           "--host", host, f"--port={port}"]
+    if is_railway:
+        cmd = [python, "-m", "uvicorn", "api.main:app",
+               "--host", host, f"--port={port}"]
+    else:
+        cmd = [python, "-m", "api.local_server",
+               "--host", host, f"--port={port}"]
     if is_railway:
         # Railway sends SIGTERM for graceful shutdown; single worker avoids
         # duplicated background-prewarm threads hammering R2.
         cmd += ["--workers", "1"]
     if dev_mode and not is_railway:
-        cmd += ["--reload",
-                "--reload-exclude=bots/*", "--reload-exclude=logs/*",
-                "--reload-exclude=*.db", "--reload-exclude=*.log"]
+        cmd += ["--reload"]
         print("  Mode: DEVELOPMENT (auto-reload ON)")
     else:
         print("  Mode: PRODUCTION (auto-reload OFF)")

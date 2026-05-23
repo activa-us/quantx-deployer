@@ -320,6 +320,8 @@ class StrategyState:
         if self.tp_pct > 1: self.tp_pct /= 100
         if self.sl_pct > 1: self.sl_pct /= 100
         self.has_short = bool(config.get('has_short', False))
+        self.bar_feed_disabled = False
+        self.bar_feed_error_logged = False
 
         # Position state: first check injected initial state, then state file
         self.current_position = int(config.get('initial_position', 0))
@@ -706,14 +708,46 @@ def main():
                   '1hour': Period.Min_60, '4hour': Period.Min_60,
                   '1day': Period.Day, '1week': Period.Week}
 
+    def _is_invalid_symbol_error(exc):
+        return 'code=301600' in str(exc) or 'invalid symbol' in str(exc).lower()
+
+    def _bars_from_candles(candles):
+        return [{'date': str(c.timestamp), 'open': float(c.open),
+                 'high': float(c.high), 'low': float(c.low),
+                 'close': float(c.close), 'volume': float(c.volume)}
+                for c in candles]
+
+    def fetch_signal_bars(st, period, count):
+        if st.bar_feed_disabled:
+            return []
+        try:
+            return _bars_from_candles(
+                quote_ctx.candlesticks(st.symbol, period, count, AdjustType.ForwardAdjust)
+            )
+        except Exception as first_error:
+            try:
+                bars = _bars_from_candles(
+                    quote_ctx.candlesticks(st.symbol, period, count, AdjustType.NoAdjust)
+                )
+                logger.warning('[%s] Forward-adjust candles failed for %s; using no-adjust bars: %s',
+                               st.sid, st.symbol, first_error)
+                return bars
+            except Exception as second_error:
+                if _is_invalid_symbol_error(first_error) or _is_invalid_symbol_error(second_error):
+                    st.bar_feed_disabled = True
+                    if not st.bar_feed_error_logged:
+                        logger.warning('[%s] Disabling bar feed for %s: LongPort rejected candles as invalid symbol (code=301600)',
+                                       st.sid, st.symbol)
+                        st.bar_feed_error_logged = True
+                    return []
+                raise second_error
+
     for st in signal_states:
         try:
             p = period_map.get(st.timeframe, Period.Day)
-            candles = quote_ctx.candlesticks(st.symbol, p, 200, AdjustType.ForwardAdjust)
-            bars = [{'date': str(c.timestamp), 'open': float(c.open),
-                     'high': float(c.high), 'low': float(c.low),
-                     'close': float(c.close), 'volume': float(c.volume)}
-                    for c in candles]
+            bars = fetch_signal_bars(st, p, 200)
+            if not bars:
+                continue
             st.data_buffer = deque(bars, maxlen=500)
             logger.info('[%s] Warmup: %d bars, last close=%.4f',
                         st.sid, len(bars), bars[-1]['close'])
@@ -879,13 +913,13 @@ def main():
             _shutdown.wait(60)
             if _shutdown.is_set(): break
             for st in signal_states:
+                if st.bar_feed_disabled:
+                    continue
                 try:
                     p = period_map.get(st.timeframe, Period.Day)
-                    candles = quote_ctx.candlesticks(st.symbol, p, 10, AdjustType.ForwardAdjust)
-                    bars = [{'date': str(c.timestamp), 'open': float(c.open),
-                             'high': float(c.high), 'low': float(c.low),
-                             'close': float(c.close), 'volume': float(c.volume)}
-                            for c in candles]
+                    bars = fetch_signal_bars(st, p, 10)
+                    if not bars:
+                        continue
                     new = [b for b in bars if b['date'] > last_dates.get(st.sid, '')]
                     if not new: continue
                     st.data_buffer.extend(new)

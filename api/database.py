@@ -288,6 +288,13 @@ def save_student(email: str, name: str, app_key: str, app_secret: str,
                  access_token: str, central_api_url: str):
     conn = get_db()
     try:
+        existing = conn.execute(
+            "SELECT app_key_enc, app_secret_enc, access_token_enc FROM students WHERE email = ?",
+            (email,),
+        ).fetchone()
+        app_key_enc = encrypt(app_key) if app_key else (existing["app_key_enc"] if existing else "")
+        app_secret_enc = encrypt(app_secret) if app_secret else (existing["app_secret_enc"] if existing else "")
+        access_token_enc = encrypt(access_token) if access_token else (existing["access_token_enc"] if existing else "")
         conn.execute(
             """INSERT INTO students (email, name, app_key_enc, app_secret_enc, access_token_enc, central_api_url)
                VALUES (?, ?, ?, ?, ?, ?)
@@ -297,8 +304,8 @@ def save_student(email: str, name: str, app_key: str, app_secret: str,
                  app_secret_enc=excluded.app_secret_enc,
                  access_token_enc=excluded.access_token_enc,
                  central_api_url=excluded.central_api_url""",
-            (email, name, encrypt(app_key), encrypt(app_secret),
-             encrypt(access_token), central_api_url),
+            (email, name, app_key_enc, app_secret_enc,
+             access_token_enc, central_api_url),
         )
         conn.commit()
     finally:
@@ -330,14 +337,23 @@ def save_strategy(email: str, strategy_id: str, strategy_name: str, symbol: str,
                   arena: str, timeframe: str, conditions: dict, exit_rules: dict,
                   risk: dict, is_active: bool = True, mode: str = "library",
                   library_id: str = "", custom_script: str = "",
-                  broker: str = "longport", is_dry_run: bool = False):
+                  broker: str = "longport", is_dry_run: bool = False,
+                  allocation: float | None = None):
     conn = get_db()
     try:
+        if allocation is None:
+            allocation = (
+                risk.get("capital")
+                or risk.get("allocation")
+                or conditions.get("capital")
+                or (conditions.get("params") or {}).get("capital")
+                or 10000
+            )
         conn.execute(
             """INSERT INTO strategies (email, strategy_id, strategy_name, symbol, arena, timeframe,
                                       conditions_json, exit_rules_json, risk_json, is_active,
-                                      mode, library_id, custom_script, broker, is_dry_run)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      mode, library_id, custom_script, broker, is_dry_run, allocation)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(strategy_id) DO UPDATE SET
                  strategy_name=excluded.strategy_name,
                  symbol=excluded.symbol,
@@ -351,11 +367,12 @@ def save_strategy(email: str, strategy_id: str, strategy_name: str, symbol: str,
                  library_id=excluded.library_id,
                  custom_script=excluded.custom_script,
                  broker=excluded.broker,
-                 is_dry_run=excluded.is_dry_run""",
+                 is_dry_run=excluded.is_dry_run,
+                 allocation=excluded.allocation""",
             (email, strategy_id, strategy_name, symbol, arena, timeframe,
              json.dumps(conditions), json.dumps(exit_rules), json.dumps(risk),
              1 if is_active else 0, mode, library_id, custom_script, broker,
-             1 if is_dry_run else 0),
+             1 if is_dry_run else 0, str(allocation)),
         )
         conn.commit()
     finally:
@@ -627,6 +644,30 @@ def get_broker_credentials(account_id: int) -> dict | None:
 
 
 # ── Backtest result cache ──────────────────────────────────────────────────
+
+def get_primary_broker_credentials(email: str, broker: str = "longport") -> dict | None:
+    """Return decrypted credentials for the preferred account of a broker."""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            """SELECT * FROM broker_accounts
+               WHERE email = ? AND broker = ?
+               ORDER BY is_connected DESC,
+                        CASE account_type WHEN 'paper' THEN 0 ELSE 1 END,
+                        id DESC
+               LIMIT 1""",
+            (email, broker),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["app_key"] = decrypt(d.get("app_key_enc", ""))
+        d["app_secret"] = decrypt(d.get("app_secret_enc", ""))
+        d["access_token"] = decrypt(d.get("access_token_enc", ""))
+        return d
+    finally:
+        conn.close()
+
 
 import hashlib
 
