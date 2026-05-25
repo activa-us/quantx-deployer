@@ -13,6 +13,7 @@ SYMBOL = '__SYMBOL__'
 CENTRAL_API_URL = '__CENTRAL_API_URL__'
 LOG_DIR = '__LOG_DIR__'
 LOG_NAME = '__LOG_NAME__'
+DRY_RUN = __DRY_RUN__
 
 os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
@@ -41,7 +42,7 @@ try:
 
     log.info("=" * 50)
     log.info("QuantX Simple LongPort Bot")
-    log.info("Email: %s | Symbol: %s", EMAIL, SYMBOL)
+    log.info("Email: %s | Symbol: %s | Dry run: %s", EMAIL, SYMBOL, DRY_RUN)
     log.info("=" * 50)
 
     from longport.openapi import Config, QuoteContext, TradeContext, OrderSide, OrderType, TimeInForceType
@@ -74,19 +75,24 @@ try:
     else:
         limit_price = round(price * 0.98, 2)
 
-    log.info("Placing limit BUY: 100 shares @ %s (2%% below market)", limit_price)
+    log.info("%s limit BUY: 100 shares @ %s (2%% below market)",
+             "[DRY RUN] Would place" if DRY_RUN else "Placing", limit_price)
 
-    resp = trade_ctx.submit_order(
-        symbol=SYMBOL,
-        order_type=OrderType.LO,
-        side=OrderSide.Buy,
-        submitted_quantity=100,
-        time_in_force=TimeInForceType.Day,
-        submitted_price=decimal.Decimal(str(limit_price)),
-        remark='QuantX bot order'
-    )
-    order_id = resp.order_id
-    log.info("ORDER PLACED! ID: %s", order_id)
+    if DRY_RUN:
+        order_id = "DRY-RUN-SIMPLE"
+        log.info("[DRY RUN] No live order submitted")
+    else:
+        resp = trade_ctx.submit_order(
+            symbol=SYMBOL,
+            order_type=OrderType.LO,
+            side=OrderSide.Buy,
+            submitted_quantity=100,
+            time_in_force=TimeInForceType.Day,
+            submitted_price=decimal.Decimal(str(limit_price)),
+            remark='QuantX bot order'
+        )
+        order_id = resp.order_id
+        log.info("ORDER PLACED! ID: %s", order_id)
 
     _tp = {"email": EMAIL, "strategy_id": "SIMPLE_TEST", "symbol": SYMBOL,
            "side": "BUY", "price": float(limit_price), "qty": 100, "pnl": 0}
@@ -96,14 +102,15 @@ try:
         try: requests.post(CENTRAL_API_URL + '/api/trade', json=_tp, timeout=3)
         except Exception: pass
 
-    log.info("Waiting 30 seconds before cancelling...")
-    time.sleep(30)
+    if not DRY_RUN:
+        log.info("Waiting 30 seconds before cancelling...")
+        time.sleep(30)
 
-    try:
-        trade_ctx.cancel_order(order_id)
-        log.info("Order cancelled: %s", order_id)
-    except Exception as e:
-        log.info("Cancel result: %s (may have filled or expired)", e)
+        try:
+            trade_ctx.cancel_order(order_id)
+            log.info("Order cancelled: %s", order_id)
+        except Exception as e:
+            log.info("Cancel result: %s (may have filled or expired)", e)
 
     log.info("Order cycle complete. Bot staying alive for monitoring.")
     log.info("Toggle OFF in the app to stop this bot.")

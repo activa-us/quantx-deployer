@@ -21,6 +21,7 @@ Architecture:
 import os, sys, json, math, csv, time, signal as _signal, logging, threading, decimal
 from collections import deque
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 
 try:
     import requests
@@ -49,6 +50,47 @@ os.makedirs(STATE_DIR, exist_ok=True)
 
 SGT = timezone(timedelta(hours=8))
 HEARTBEAT_INTERVAL = 60
+
+class DryRunQuoteContext:
+    """Minimal quote context so dry-run bots can start without broker credentials."""
+    def __init__(self):
+        self._on_quote = None
+
+    def _price_for(self, symbol):
+        seed = sum(ord(c) for c in str(symbol))
+        return round(50 + (seed % 250) + ((seed % 17) / 10), 2)
+
+    def quote(self, symbols):
+        return [
+            SimpleNamespace(symbol=s, last_done=self._price_for(s))
+            for s in (symbols or [])
+        ]
+
+    def candlesticks(self, symbol, period, count, adjust_type):
+        price = self._price_for(symbol)
+        now = datetime.now(timezone.utc)
+        candles = []
+        for i in range(max(1, int(count))):
+            ts = now - timedelta(days=max(0, int(count) - i - 1))
+            drift = (i - int(count) / 2) * 0.03
+            close = round(max(1, price + drift), 2)
+            candles.append(SimpleNamespace(
+                timestamp=ts.isoformat(),
+                open=close,
+                high=round(close * 1.005, 2),
+                low=round(close * 0.995, 2),
+                close=close,
+                volume=100000,
+            ))
+        return candles
+
+    def set_on_quote(self, callback):
+        self._on_quote = callback
+
+    def subscribe(self, symbols, subtypes):
+        if self._on_quote:
+            for q in self.quote(symbols):
+                self._on_quote(q.symbol, q)
 
 # Strategies list -- injected at generation time
 STRATEGIES = __STRATEGIES_LIST__
@@ -320,8 +362,6 @@ class StrategyState:
         if self.tp_pct > 1: self.tp_pct /= 100
         if self.sl_pct > 1: self.sl_pct /= 100
         self.has_short = bool(config.get('has_short', False))
-        self.bar_feed_disabled = False
-        self.bar_feed_error_logged = False
 
         # Position state: first check injected initial state, then state file
         self.current_position = int(config.get('initial_position', 0))
@@ -647,15 +687,20 @@ def main():
         logger.error('longport package not installed')
         return
 
-    # ONE connection for everything
-    cfg = Config(app_key=APP_KEY, app_secret=APP_SECRET, access_token=ACCESS_TOKEN)
-    quote_ctx = QuoteContext(cfg)
-    if DRY_RUN:
+    have_credentials = bool(APP_KEY and APP_SECRET and ACCESS_TOKEN)
+    if DRY_RUN and not have_credentials:
+        quote_ctx = DryRunQuoteContext()
         trade_ctx = None
-        logger.info('DRY RUN: QuoteContext connected (TradeContext skipped)')
+        logger.warning('DRY RUN: LongPort credentials missing; using simulated quote data')
     else:
-        trade_ctx = TradeContext(cfg)
-        logger.info('LongPort connected (2 connections: quote + trade)')
+        cfg = Config(app_key=APP_KEY, app_secret=APP_SECRET, access_token=ACCESS_TOKEN)
+        quote_ctx = QuoteContext(cfg)
+        if DRY_RUN:
+            trade_ctx = None
+            logger.info('DRY RUN: QuoteContext connected (TradeContext skipped)')
+        else:
+            trade_ctx = TradeContext(cfg)
+            logger.info('LongPort connected (2 connections: quote + trade)')
 
     # ── Classify strategies: signal-based vs grid ──────────────────────────
     # The SIGNAL_FUNCTIONS_BLOCK block defines compute_signals_XXXX for each strategy
@@ -708,46 +753,14 @@ def main():
                   '1hour': Period.Min_60, '4hour': Period.Min_60,
                   '1day': Period.Day, '1week': Period.Week}
 
-    def _is_invalid_symbol_error(exc):
-        return 'code=301600' in str(exc) or 'invalid symbol' in str(exc).lower()
-
-    def _bars_from_candles(candles):
-        return [{'date': str(c.timestamp), 'open': float(c.open),
-                 'high': float(c.high), 'low': float(c.low),
-                 'close': float(c.close), 'volume': float(c.volume)}
-                for c in candles]
-
-    def fetch_signal_bars(st, period, count):
-        if st.bar_feed_disabled:
-            return []
-        try:
-            return _bars_from_candles(
-                quote_ctx.candlesticks(st.symbol, period, count, AdjustType.ForwardAdjust)
-            )
-        except Exception as first_error:
-            try:
-                bars = _bars_from_candles(
-                    quote_ctx.candlesticks(st.symbol, period, count, AdjustType.NoAdjust)
-                )
-                logger.warning('[%s] Forward-adjust candles failed for %s; using no-adjust bars: %s',
-                               st.sid, st.symbol, first_error)
-                return bars
-            except Exception as second_error:
-                if _is_invalid_symbol_error(first_error) or _is_invalid_symbol_error(second_error):
-                    st.bar_feed_disabled = True
-                    if not st.bar_feed_error_logged:
-                        logger.warning('[%s] Disabling bar feed for %s: LongPort rejected candles as invalid symbol (code=301600)',
-                                       st.sid, st.symbol)
-                        st.bar_feed_error_logged = True
-                    return []
-                raise second_error
-
     for st in signal_states:
         try:
             p = period_map.get(st.timeframe, Period.Day)
-            bars = fetch_signal_bars(st, p, 200)
-            if not bars:
-                continue
+            candles = quote_ctx.candlesticks(st.symbol, p, 200, AdjustType.ForwardAdjust)
+            bars = [{'date': str(c.timestamp), 'open': float(c.open),
+                     'high': float(c.high), 'low': float(c.low),
+                     'close': float(c.close), 'volume': float(c.volume)}
+                    for c in candles]
             st.data_buffer = deque(bars, maxlen=500)
             logger.info('[%s] Warmup: %d bars, last close=%.4f',
                         st.sid, len(bars), bars[-1]['close'])
@@ -913,13 +926,13 @@ def main():
             _shutdown.wait(60)
             if _shutdown.is_set(): break
             for st in signal_states:
-                if st.bar_feed_disabled:
-                    continue
                 try:
                     p = period_map.get(st.timeframe, Period.Day)
-                    bars = fetch_signal_bars(st, p, 10)
-                    if not bars:
-                        continue
+                    candles = quote_ctx.candlesticks(st.symbol, p, 10, AdjustType.ForwardAdjust)
+                    bars = [{'date': str(c.timestamp), 'open': float(c.open),
+                             'high': float(c.high), 'low': float(c.low),
+                             'close': float(c.close), 'volume': float(c.volume)}
+                            for c in candles]
                     new = [b for b in bars if b['date'] > last_dates.get(st.sid, '')]
                     if not new: continue
                     st.data_buffer.extend(new)

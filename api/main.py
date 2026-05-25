@@ -21,9 +21,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, Form, BackgroundTasks, Body
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 
@@ -38,7 +37,6 @@ from api.database import (
     get_latest_process, log_trade, get_trades, decrypt,
     get_broker_accounts, get_broker_account, save_broker_account,
     update_broker_account_status, delete_broker_account, get_broker_credentials,
-    get_primary_broker_credentials,
 )
 # Dual-mode init: PostgreSQL when DATABASE_URL is set, SQLite otherwise.
 from api.database import init_db
@@ -131,33 +129,6 @@ def get_lp_trade_ctx(app_key: str, app_secret: str, access_token: str):
     return ctx
 
 
-def _has_complete_lp_credentials(student: dict | None) -> bool:
-    return bool(
-        student
-        and (student.get("app_key") or "").strip()
-        and (student.get("app_secret") or "").strip()
-        and (student.get("access_token") or "").strip()
-    )
-
-
-def _resolve_lp_credentials(email: str, student: dict | None = None) -> dict | None:
-    """Prefer legacy student creds, fall back to the broker account table."""
-    if _has_complete_lp_credentials(student):
-        return {
-            "app_key": student["app_key"],
-            "app_secret": student["app_secret"],
-            "access_token": student["access_token"],
-        }
-    acct = get_primary_broker_credentials(email.lower().strip(), "longport") if email else None
-    if _has_complete_lp_credentials(acct):
-        return {
-            "app_key": acct["app_key"],
-            "app_secret": acct["app_secret"],
-            "access_token": acct["access_token"],
-        }
-    return None
-
-
 def cleanup_lp_pool() -> int:
     """Drop contexts untouched for > 2x TTL. Returns number removed. Safe to
     call from a periodic task -- not wired to any scheduler by default."""
@@ -192,7 +163,6 @@ class StrategyReq(BaseModel):
     strategy_id: str
     strategy_name: str = ""
     symbol: str = ""
-    allocation: Optional[float] = None
     arena: str = "US"
     timeframe: str = "1m"
     conditions: dict = {}
@@ -204,6 +174,7 @@ class StrategyReq(BaseModel):
     custom_script: str = ""
     broker: str = "longport"
     is_dry_run: bool = False
+    allocation: float = 10000
 
 
 class ValidateScriptReq(BaseModel):
@@ -213,6 +184,7 @@ class ValidateScriptReq(BaseModel):
 class DeployReq(BaseModel):
     email: str
     dry_run: Optional[bool] = None  # None = use strategy flags; True/False = explicit override
+    strategy_id: str = ""
 
 
 class StopReq(BaseModel):
@@ -372,9 +344,6 @@ def _startup_prewarm():
     except Exception as e:
         _log.warning("[PREWARM] Module import failed: %s", e)
 
-
-@asynccontextmanager
-
 # ── Orchestrator scan loop (runs as background thread on Railway) ────────────
 def _orchestrator_loop():
     """Scan /data/bots/ every 30s and manage bot subprocesses."""
@@ -432,6 +401,7 @@ def _orchestrator_loop():
             _log.warning("[ORCH] Scan error: %s", e)
         time.sleep(30)
 
+@asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     _auto_restart_bots()
@@ -453,13 +423,6 @@ async def lifespan(app: FastAPI):
                 pass
 
 app = FastAPI(title="QuantX Deployer", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ── Symbol cache ────────────────────────────────────────────────────────────
 _symbol_cache: dict[str, dict] = {
@@ -758,7 +721,7 @@ async def login(req: RegisterReq):
         "found": True,
         "email": student["email"],
         "name": student["name"],
-        "has_credentials": bool(_resolve_lp_credentials(student["email"], student)),
+        "has_credentials": bool(student.get("app_key")),
         "central_api_url": student.get("central_api_url", ""),
     }
 
@@ -775,7 +738,7 @@ async def me(email: str = Query("")):
         "found": True,
         "email": student["email"],
         "name": student["name"],
-        "has_credentials": bool(_resolve_lp_credentials(student["email"], student)),
+        "has_credentials": bool(student.get("app_key")),
         "central_api_url": student.get("central_api_url", ""),
     }
 
@@ -803,17 +766,28 @@ async def strategy_detail(strategy_id: str, email: str = Query("")):
         if not row:
             raise HTTPException(404, "Strategy not found")
         rk = row.keys()
+        conditions = _safe_json(row, "conditions_json") or {}
+        backtest_results = _safe_json(row, "backtest_results_json")
+        allocation = float(row["allocation"]) if "allocation" in rk and row["allocation"] else 10000
+        if isinstance(backtest_results, dict):
+            bt_cap = backtest_results.get("initial_capital")
+            if bt_cap is None and isinstance(backtest_results.get("metrics"), dict):
+                bt_cap = backtest_results["metrics"].get("initial_capital")
+            if bt_cap is not None:
+                allocation = float(bt_cap)
+        elif isinstance(conditions, dict) and conditions.get("capital") is not None:
+            allocation = float(conditions.get("capital"))
         return {
             "strategy_id": row["strategy_id"], "strategy_name": row["strategy_name"],
             "symbol": row["symbol"], "arena": row["arena"],
             "timeframe": row["timeframe"] if "timeframe" in rk else "1day",
-            "conditions": _safe_json(row, "conditions_json") or {},
+            "conditions": conditions,
             "risk": _safe_json(row, "risk_json") or {},
             "is_active": bool(row["is_active"]),
             "mode": row["mode"] if "mode" in rk else "library",
             "library_id": row["library_id"] if "library_id" in rk else "",
-            "allocation": float(row["allocation"]) if "allocation" in rk and row["allocation"] else 10000,
-            "backtest_results": _safe_json(row, "backtest_results_json"),
+            "allocation": allocation,
+            "backtest_results": backtest_results,
             "live_results": _safe_json(row, "live_results_json"),
             "trade_log": _safe_json(row, "trade_log_json") or [],
             "created_at": row["created_at"] if "created_at" in rk else "",
@@ -831,8 +805,17 @@ async def strategy_detail(strategy_id: str, email: str = Query("")):
 async def save_backtest_results(strategy_id: str, body: dict):
     conn = get_db()
     try:
-        conn.execute("UPDATE strategies SET backtest_results_json = ? WHERE strategy_id = ?",
-                     (json.dumps(body), strategy_id))
+        initial_capital = body.get("initial_capital")
+        if initial_capital is None and isinstance(body.get("metrics"), dict):
+            initial_capital = body["metrics"].get("initial_capital")
+        if initial_capital is not None:
+            conn.execute(
+                "UPDATE strategies SET backtest_results_json = ?, allocation = ? WHERE strategy_id = ?",
+                (json.dumps(body), float(initial_capital), strategy_id),
+            )
+        else:
+            conn.execute("UPDATE strategies SET backtest_results_json = ? WHERE strategy_id = ?",
+                         (json.dumps(body), strategy_id))
         conn.commit()
     except Exception as e:
         _log.error("save_backtest_results: %s", e)
@@ -903,8 +886,11 @@ async def backtest_run(body: BacktestReq):
         hint = (body.broker_hint or "").lower()
         lp_creds = None
         if body.email and hint != "yahoo":
-            email = body.email.lower().strip()
-            lp_creds = _resolve_lp_credentials(email, get_student(email))
+            student = get_student(body.email.lower().strip())
+            if student and student.get("app_key"):
+                lp_creds = {"app_key": student["app_key"],
+                            "app_secret": student["app_secret"],
+                            "access_token": student["access_token"]}
         # If user explicitly chose Yahoo, skip broker data sources
         if hint == "yahoo":
             lp_creds = None
@@ -969,8 +955,13 @@ async def backtest_optimize(body: OptimizeReq):
         hint = (body.broker_hint or "").lower()
         lp_creds = None
         if body.email and hint != "yahoo":
-            email = body.email.lower().strip()
-            lp_creds = _resolve_lp_credentials(email, get_student(email))
+            student = get_student(body.email.lower().strip())
+            if student and student.get("app_key"):
+                lp_creds = {
+                    "app_key": student["app_key"],
+                    "app_secret": student["app_secret"],
+                    "access_token": student["access_token"],
+                }
         if hint == "yahoo":
             lp_creds = None
 
@@ -1007,7 +998,6 @@ async def backtest_optimize(body: OptimizeReq):
 @app.post("/api/backtest/optimize-stream-lib")
 async def backtest_optimize_stream_lib(request: Request):
     import itertools as _it
-    import heapq as _heapq
     body = await request.json()
     symbol      = body.get("symbol", "")
     timeframe   = body.get("timeframe", "1day")
@@ -1026,7 +1016,6 @@ async def backtest_optimize_stream_lib(request: Request):
     keys   = list(param_grid.keys())
     combos = [dict(zip(keys, c)) for c in _it.product(*param_grid.values())]
     total  = len(combos)
-    top_n = max(1, min(int(body.get("top_n", 200)), 500))
 
     from api.data_manager import fetch_bars_waterfall_sync
     from api.backtest import run_backtest, _walk_forward_test, _monte_carlo_test
@@ -1034,8 +1023,11 @@ async def backtest_optimize_stream_lib(request: Request):
     def _get_bars():
         lp_creds = None
         if email and broker_hint != "yahoo":
-            email_key = email.lower().strip()
-            lp_creds = _resolve_lp_credentials(email_key, get_student(email_key))
+            student = get_student(email.lower().strip())
+            if student and student.get("app_key"):
+                lp_creds = {"app_key": student["app_key"],
+                            "app_secret": student["app_secret"],
+                            "access_token": student["access_token"]}
         return fetch_bars_waterfall_sync(
             symbol=symbol, timeframe=timeframe, limit=limit,
             db_path=str(DB_PATH), lp_credentials=lp_creds,
@@ -1051,22 +1043,14 @@ async def backtest_optimize_stream_lib(request: Request):
         t0 = _t.time()
         yield "data: " + json.dumps({"type": "start", "total": total,
             "message": "Starting %d combinations..." % total}) + "\n\n"
-        top_results = []
-
-        def _score(entry):
-            wf_pass = 1 if (entry.get("walk_forward") or {}).get("pass") else 0
-            sharpe = entry["metrics"].get("sharpe_ratio", 0) or 0
-            ret = entry["metrics"].get("total_return_pct", 0) or 0
-            return (wf_pass, sharpe, ret)
-
+        results = []
         for idx, params in enumerate(combos):
-            done = idx + 1
             elapsed = round(_t.time() - t0, 1)
-            eta = round((elapsed / max(done, 1)) * (total - done), 1) if done > 0 else 0
+            eta = round((elapsed / max(idx, 1)) * (total - idx), 1) if idx > 0 else 0
             pstr = ", ".join("%s=%s" % (k, v) for k, v in list(params.items())[:3])
-            yield "data: " + json.dumps({"type": "progress", "done": done,
+            yield "data: " + json.dumps({"type": "progress", "done": idx,
                 "total": total, "pct": int(idx / total * 100),
-                "message": "Testing %d/%d: %s" % (done, total, pstr),
+                "message": "Testing %d/%d: %s" % (idx+1, total, pstr),
                 "elapsed": elapsed, "eta": eta}) + "\n\n"
             try:
                 r = run_backtest(bars, strategy, params, initial_capital)
@@ -1078,11 +1062,7 @@ async def backtest_optimize_stream_lib(request: Request):
                 if enable_mc:
                     entry["monte_carlo"] = _monte_carlo_test(
                         r.get("trades", []), initial_capital)
-                scored = (_score(entry), idx, entry)
-                if len(top_results) < top_n:
-                    _heapq.heappush(top_results, scored)
-                elif scored[0] > top_results[0][0]:
-                    _heapq.heapreplace(top_results, scored)
+                results.append(entry)
                 yield "data: " + json.dumps({"type": "result", "index": idx,
                     "params": entry["params"], "metrics": entry["metrics"],
                     "walk_forward": entry["walk_forward"],
@@ -1092,15 +1072,13 @@ async def backtest_optimize_stream_lib(request: Request):
                     "params": params, "error": str(exc)}) + "\n\n"
 
         elapsed = round(_t.time() - t0, 1)
-        results = [item[2] for item in sorted(top_results, key=lambda x: x[0], reverse=True)]
         results.sort(key=lambda x: (
             0 if (x.get("walk_forward") or {}).get("pass") else 1,
             -(x["metrics"].get("sharpe_ratio", 0) or 0)))
         yield "data: " + json.dumps({"type": "complete",
-            "total_results": total, "returned_results": len(results), "elapsed": elapsed,
+            "total_results": len(results), "elapsed": elapsed,
             "results": results,
-            "message": "Done! %d combinations in %.1fs; showing top %d"
-                       % (total, elapsed, len(results))}) + "\n\n"
+            "message": "Done! %d combinations in %.1fs" % (total, elapsed)}) + "\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1114,8 +1092,11 @@ async def backtest_run_script(body: ScriptBacktestReq):
         hint = (body.broker_hint or "").lower()
         lp_creds = None
         if body.email and hint != "yahoo":
-            email = body.email.lower().strip()
-            lp_creds = _resolve_lp_credentials(email, get_student(email))
+            student = get_student(body.email.lower().strip())
+            if student and student.get("app_key"):
+                lp_creds = {"app_key": student["app_key"],
+                            "app_secret": student["app_secret"],
+                            "access_token": student["access_token"]}
         if hint == "yahoo":
             lp_creds = None
         data = fetch_bars_waterfall_sync(
@@ -1163,8 +1144,13 @@ async def backtest_sweep_script(body: SweepScriptReq):
         # Get LP credentials if email provided (for LongPort data source)
         lp_creds = None
         if body.email:
-            email = body.email.lower().strip()
-            lp_creds = _resolve_lp_credentials(email, get_student(email))
+            student = get_student(body.email.lower().strip())
+            if student and student.get("app_key"):
+                lp_creds = {
+                    "app_key": student["app_key"],
+                    "app_secret": student["app_secret"],
+                    "access_token": student["access_token"],
+                }
         # Fetch data ONCE for all combos using full waterfall
         data = fetch_bars_waterfall_sync(
             symbol=body.symbol, timeframe=body.timeframe, limit=body.limit,
@@ -1226,8 +1212,11 @@ async def backtest_optimize_stream(request: Request):
     def _get_bars():
         lp_creds = None
         if email:
-            email_key = email.lower().strip()
-            lp_creds = _resolve_lp_credentials(email_key, get_student(email_key))
+            student = get_student(email.lower().strip())
+            if student and student.get("app_key"):
+                lp_creds = {"app_key": student["app_key"],
+                            "app_secret": student["app_secret"],
+                            "access_token": student["access_token"]}
         return fetch_bars_waterfall_sync(
             symbol=symbol, timeframe=timeframe, limit=limit,
             db_path=str(DB_PATH), lp_credentials=lp_creds,
@@ -1645,10 +1634,8 @@ async def deploy_options_bot(request: Request):
     # Pull credentials from the legacy single-set-per-student store
     # (matches the pattern used by all other LP routes in this file).
     student = get_student(email)
-    lp_creds = _resolve_lp_credentials(email, student)
-    if not lp_creds:
+    if not student or not student.get("app_key"):
         raise HTTPException(400, "No LongPort credentials on file for this student")
-    student.update(lp_creds)
 
     student_payload = {
         "email":           email,
@@ -2035,13 +2022,6 @@ async def screen_now(req: ScreenNowReq):
     student = get_student(email)
     if not student:
         raise HTTPException(404, "Student not found")
-    lp_creds = _resolve_lp_credentials(email, student)
-    if not lp_creds:
-        raise HTTPException(
-            400,
-            "LongPort credentials incomplete for this email. Re-add the account in Brokers with App Key, App Secret, and Access Token.",
-        )
-    student.update(lp_creds)
     from api.universe import get_universe
     from api.screener import run_screener
     universe = get_universe(req.bot_type, req.arena, req.custom_tickers)
@@ -2239,7 +2219,7 @@ async def clone_strategy(strategy_id: str, body: dict = Body(...)):
         src["timeframe"], src["conditions"], src["exit_rules"], src["risk"],
         is_active=False, mode=src["mode"], library_id=src.get("library_id",""),
         custom_script=src.get("custom_script",""), broker=src.get("broker","longport"),
-        is_dry_run=new_dry_run, allocation=src.get("allocation"),
+        is_dry_run=new_dry_run, allocation=src.get("allocation", 10000),
     )
     return {"status": "cloned", "new_strategy_id": new_id, "is_dry_run": new_dry_run}
 
@@ -2370,12 +2350,6 @@ async def deploy_check(email: str = Query("")):
     student = get_student(email)
     if not student:
         raise HTTPException(404, "Student not registered")
-    lp_creds = _resolve_lp_credentials(email, student)
-    if not lp_creds:
-        raise HTTPException(
-            400,
-            "LongPort credentials incomplete for this email. Re-add the account in Brokers with App Key, App Secret, and Access Token.",
-        )
     open_positions = read_open_positions(email)
     is_running = email in _running_processes and \
                  _running_processes[email].poll() is None
@@ -2395,13 +2369,6 @@ async def close_and_redeploy(req: DeployReq):
     student = get_student(email)
     if not student:
         raise HTTPException(404, "Student not registered")
-    lp_creds = _resolve_lp_credentials(email, student)
-    if not lp_creds:
-        raise HTTPException(
-            400,
-            "LongPort credentials incomplete for this email. Re-add the account in Brokers with App Key, App Secret, and Access Token.",
-        )
-    student.update(lp_creds)
     open_positions = read_open_positions(email)
     close_result = {"closed": [], "failed": []}
     if open_positions:
@@ -2420,26 +2387,27 @@ async def deploy(req: DeployReq):
     student = get_student(email)
     if not student:
         raise HTTPException(404, "Student not registered")
-    lp_creds = _resolve_lp_credentials(email, student)
-    if not lp_creds:
-        raise HTTPException(
-            400,
-            "LongPort credentials incomplete for this email. Re-add the account in Brokers with App Key, App Secret, and Access Token.",
-        )
-    student.update(lp_creds)
 
-    # Stop existing process first
-    if email in _running_processes:
-        _stop_process(email)
+    # Targeted deploys come from a row button. Mark the clicked strategy active,
+    # keep any already-active strategies, then regenerate one master bot for the
+    # active set.
+    if req.strategy_id:
+        conn_active = get_db()
+        try:
+            row = conn_active.execute(
+                "SELECT 1 FROM strategies WHERE email = ? AND strategy_id = ?",
+                (email, req.strategy_id),
+            ).fetchone()
+            if not row:
+                raise HTTPException(400, "No matching strategy to deploy")
+            conn_active.execute(
+                "UPDATE strategies SET is_active = 1 WHERE email = ? AND strategy_id = ?",
+                (email, req.strategy_id),
+            )
+            conn_active.commit()
+        finally:
+            conn_active.close()
 
-    # Clear any stale 'running' process records so _auto_restart_bots
-    # doesn't re-launch the old broken script on next restart
-    conn_clear = get_db()
-    conn_clear.execute("UPDATE processes SET status='stopped' WHERE email=?", (email,))
-    conn_clear.commit()
-    conn_clear.close()
-
-    # Get active strategies
     strategies = get_strategies(email, active_only=True)
     if not strategies:
         raise HTTPException(400, "No active strategies to deploy")
@@ -2455,6 +2423,36 @@ async def deploy(req: DeployReq):
     # All strategies are LongPort
     lp_strats = list(strategies)
 
+    req_dry_run = getattr(req, "dry_run", None)
+    if req_dry_run is True:
+        dry_run = True
+    elif req_dry_run is False:
+        dry_run = False
+    else:
+        dry_run = any(s.get("is_dry_run") for s in lp_strats)
+
+    if not dry_run and not all(student.get(k, "") for k in ("app_key", "app_secret", "access_token")):
+        raise HTTPException(
+            400,
+            "Live deploy requires LongPort credentials. Add credentials under Brokers, or use Deploy (Dry).",
+        )
+
+    # Stop existing process first
+    if email in _running_processes:
+        _stop_process(email)
+
+    # Clear any stale 'running' process records so _auto_restart_bots
+    # doesn't re-launch the old broken script on next restart
+    conn_clear = get_db()
+    conn_clear.execute("UPDATE processes SET status='stopped' WHERE email=?", (email,))
+    conn_clear.commit()
+    conn_clear.close()
+
+    # Dry-run and missing-credential deploys cannot cancel live broker orders.
+    old_cancelled = 0
+    if not dry_run and all(student.get(k, "") for k in ("app_key", "app_secret", "access_token")):
+        old_cancelled = _cancel_student_orders(student)
+
     # Check for simple/quick_test strategies — deploy as individual simple bots
     deployed_simple = []
     for s in strategies:
@@ -2465,7 +2463,7 @@ async def deploy(req: DeployReq):
         if is_quick:
             sym = s.get("symbol", "700.HK")
             try:
-                sp, lp = generate_simple_lp_bot(email, sym, student)
+                sp, lp = generate_simple_lp_bot(email, sym, student, dry_run=dry_run)
                 proc = _launch_bot(sp, lp)
                 save_process(email, proc.pid, "running", sp, lp)
                 deployed_simple.append({"strategy_id": s["strategy_id"], "pid": proc.pid, "broker": "longport"})
@@ -2477,7 +2475,13 @@ async def deploy(req: DeployReq):
             lp_strats = [x for x in lp_strats if x["strategy_id"] != s["strategy_id"]]
 
     if not lp_strats:
-        return {"status": "deployed", "strategies_count": 0, "central_api_url": central_url}
+        return {
+            "status": "deployed",
+            "strategies_count": 0,
+            "active_strategy_ids": [s.get("strategy_id", "") for s in strategies],
+            "central_api_url": central_url,
+            "dry_run": dry_run,
+        }
 
     # Generate LP master bot (shared connections for ALL LP strategies)
     # get_student() already returns decrypted credentials
@@ -2506,9 +2510,6 @@ async def deploy(req: DeployReq):
     else:
         # Not specified — use strategy-level flags
         dry_run = any(s.get("is_dry_run") for s in lp_strats)
-    old_cancelled = 0
-    if not dry_run:
-        old_cancelled = _cancel_student_orders(student)
     try:
         script_path, log_path = generate_lp_master_bot(
             email, lp_strats, lp_creds, dry_run=dry_run)
@@ -2527,8 +2528,8 @@ async def deploy(req: DeployReq):
         _log.info("[DEPLOY] LP master PID: %s (%d strategies, 2 connections, dry_run=%s)",
                   proc.pid, len(lp_strats), dry_run)
 
-        # Wait 3 seconds to check for immediate crash
-        time.sleep(3)
+        # Wait briefly to catch immediate crashes without blocking the API loop.
+        await asyncio.sleep(3)
         exit_code = proc.poll()
         if exit_code is not None:
             del _running_processes[email]
@@ -2555,6 +2556,7 @@ async def deploy(req: DeployReq):
             "script": script_path,
             "log_path": log_path,
             "strategies_count": len(strategies),
+            "active_strategy_ids": [s.get("strategy_id", "") for s in strategies],
             "lp_strategies": len(lp_strats),
             "lp_connections": 2,
             "central_api_url": central_url,
@@ -2575,6 +2577,12 @@ async def stop(req: StopReq):
     else:
         _kill_process_by_db(email)
         stopped.append("longport")
+    conn_stop = get_db()
+    try:
+        conn_stop.execute("UPDATE strategies SET is_active = 0 WHERE email = ?", (email,))
+        conn_stop.commit()
+    finally:
+        conn_stop.close()
     if not stopped and email not in _running_processes:
         return {"status": "stopped", "message": "No running bot found"}
     return {"status": "stopped", "brokers_stopped": stopped}
@@ -3015,6 +3023,10 @@ async def status(email: str):
             lp_running = True
 
     strategies = get_strategies(email)
+    active_strategy_ids = [
+        s.get("strategy_id", "") for s in strategies
+        if s.get("is_active")
+    ]
     trades = get_trades(email)
     strat_pnl = defaultdict(float)
     for t in trades:
@@ -3042,6 +3054,8 @@ async def status(email: str):
         "is_running": lp_running,
         "bot_status": "running" if lp_running else "stopped",
         "dry_run": dry_run_active,
+        "active_strategy_ids": active_strategy_ids if lp_running else [],
+        "active_strategy_id": active_strategy_ids[0] if lp_running and active_strategy_ids else "",
         "strategies": [
             {**s, "total_pnl": round(strat_pnl.get(s["strategy_id"], 0), 4)}
             for s in strategies
@@ -3051,11 +3065,13 @@ async def status(email: str):
     }
 
 
-def _find_strategy_log_path(email: str, strategy_id: str) -> tuple[Path | None, str]:
+@app.get("/api/logs/{email}/{strategy_id}")
+async def strategy_logs(email: str, strategy_id: str, lines: int = Query(50, ge=1, le=500)):
     email = email.lower().strip()
     email_safe = email.replace("@", "_at_").replace(".", "_")
-    safe_sid = strategy_id.replace("/", "_").replace("\\", "_")
+    safe_sid = strategy_id.replace("/", "_")
     logs_dir = LOGS_DIR
+    # Search for log file in order of specificity
     candidates = [
         f"{email_safe}_lp_master.log",         # LongPort LP master (Railway)
         f"{email_safe}_{safe_sid}.log",        # strategy-specific
@@ -3064,29 +3080,9 @@ def _find_strategy_log_path(email: str, strategy_id: str) -> tuple[Path | None, 
     for fname in candidates:
         log_path = logs_dir / fname
         if log_path.exists():
-            return log_path, fname
-    return None, ""
-
-
-@app.get("/api/logs/{email}/{strategy_id}/download")
-async def strategy_log_download(email: str, strategy_id: str):
-    log_path, fname = _find_strategy_log_path(email, strategy_id)
-    if not log_path:
-        raise HTTPException(404, "No log file found yet. Deploy a bot to start logging.")
-    return FileResponse(
-        path=str(log_path),
-        filename=fname,
-        media_type="text/plain",
-    )
-
-
-@app.get("/api/logs/{email}/{strategy_id}")
-async def strategy_logs(email: str, strategy_id: str, lines: int = Query(50, ge=1, le=500)):
-    log_path, fname = _find_strategy_log_path(email, strategy_id)
-    if log_path:
-        all_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        return {"lines": all_lines[-lines:], "total": len(all_lines),
-                "strategy_id": strategy_id, "filename": fname}
+            all_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            return {"lines": all_lines[-lines:], "total": len(all_lines),
+                    "strategy_id": strategy_id, "filename": fname}
     return {"lines": ["No log file found yet. Deploy a bot to start logging."],
             "total": 0, "strategy_id": strategy_id, "filename": ""}
 
@@ -3390,10 +3386,8 @@ async def trade_report(req: TradeReq):
 def _fetch_symbol_lp(symbol: str, email: str) -> dict:
     """Blocking LongPort symbol lookup — runs in thread pool."""
     student = get_student(email) if email else None
-    lp_creds = _resolve_lp_credentials(email, student)
-    if not lp_creds:
-        return {"found": False, "error": "Connect LongPort to search unlisted symbols."}
-    student = {**(student or {}), **lp_creds}
+    if not student:
+        return {"found": False, "error": "Register to search unlisted symbols."}
     try:
         ctx = get_lp_quote_ctx(student["app_key"], student["app_secret"], student["access_token"])
         result = ctx.static_info([symbol])
@@ -3436,8 +3430,11 @@ async def ticker_search(q: str = Query(""), email: str = Query("")):
     from api.ticker_search import search_ticker
     lp_creds = None
     if email:
-        email_key = email.lower().strip()
-        lp_creds = _resolve_lp_credentials(email_key, get_student(email_key))
+        student = get_student(email.lower().strip())
+        if student and student.get("app_key"):
+            lp_creds = {"app_key": student["app_key"],
+                        "app_secret": student["app_secret"],
+                        "access_token": student["access_token"]}
 
     def _search():
         return search_ticker(q, lp_creds, limit=10)
@@ -3453,7 +3450,10 @@ async def ticker_validate(symbol: str = Query(""), email: str = Query("")):
         return {"valid": False, "result": None}
     student = get_student(email.lower().strip())
     lp_creds = None
-    lp_creds = _resolve_lp_credentials(email.lower().strip(), student)
+    if student and student.get("app_key"):
+        lp_creds = {"app_key": student["app_key"],
+                    "app_secret": student["app_secret"],
+                    "access_token": student["access_token"]}
 
     def _validate():
         from api.ticker_search import lookup_lp
@@ -3475,13 +3475,6 @@ async def test_connection(req: DeployReq):
     student = get_student(email)
     if not student:
         raise HTTPException(404, "Student not registered")
-    lp_creds = _resolve_lp_credentials(email, student)
-    if not lp_creds:
-        raise HTTPException(
-            400,
-            "LongPort credentials incomplete for this email. Re-add the account in Brokers with App Key, App Secret, and Access Token.",
-        )
-    student.update(lp_creds)
     def _test_lp():
         try:
             ctx = get_lp_quote_ctx(student["app_key"], student["app_secret"], student["access_token"])
@@ -3654,6 +3647,6 @@ def _stop_process(email: str):
     update_process_status(email, "stopped")
 
 if __name__ == "__main__":
-    from api.local_server import main as run_local_server
-
-    run_local_server()
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run("api.main:app", host="0.0.0.0", port=port, app_dir=str(Path(__file__).parent.parent))

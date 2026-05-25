@@ -590,7 +590,7 @@ label { display:block; font-size:12px; font-weight:600; color:var(--text-seconda
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
       <span id="bd-log-status" style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--green)"><span style="width:8px;height:8px;border-radius:50%;background:var(--green);display:inline-block"></span> Live</span>
       <span style="font-size:11px;color:var(--text-muted)">Polling every 3s</span>
-      <button id="bd-log-filename" onclick="downloadBotLog()" style="font-size:10px;color:var(--blue-primary);margin-left:auto;font-family:monospace;cursor:pointer;background:var(--blue-pale);padding:2px 8px;border:0;border-radius:4px;display:none" title="Download log file"></button>
+      <span id="bd-log-filename" onclick="copyLogFilename()" style="font-size:10px;color:var(--blue-primary);margin-left:auto;font-family:monospace;cursor:pointer;background:var(--blue-pale);padding:2px 8px;border-radius:4px;display:none" title="Click to copy log path"></span>
     </div>
     <div class="log-viewer" id="bd-log-content" style="color:#4ADE80;min-height:400px">Waiting for logs...</div>
   </div>
@@ -1693,15 +1693,15 @@ label { display:block; font-size:12px; font-weight:600; color:var(--text-seconda
       <div class="form-group" style="margin-bottom:14px">
         <label>Bot Mode</label>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px">
-          <label id="nb-mode-dry-label" onclick="setNbMode('dry')" style="display:flex;align-items:center;gap:10px;padding:10px 14px;border:2px solid #6D28D9;border-radius:8px;cursor:pointer;background:#F5F3FF">
-            <input type="radio" name="nb-mode" id="nb-mode-dry" value="dry" checked style="accent-color:#6D28D9">
+          <label id="nb-mode-dry-label" style="display:flex;align-items:center;gap:10px;padding:10px 14px;border:2px solid #6D28D9;border-radius:8px;cursor:pointer;background:#F5F3FF">
+            <input type="radio" name="nb-mode" id="nb-mode-dry" value="dry" checked onchange="setNbMode('dry')" style="accent-color:#6D28D9">
             <div>
               <div style="font-weight:600;font-size:13px;color:#5B21B6">🧪 Dry Run</div>
               <div style="font-size:11px;color:#7C3AED">Simulated — no real orders</div>
             </div>
           </label>
-          <label id="nb-mode-live-label" onclick="setNbMode('live')" style="display:flex;align-items:center;gap:10px;padding:10px 14px;border:2px solid var(--border);border-radius:8px;cursor:pointer;background:var(--surface)">
-            <input type="radio" name="nb-mode" id="nb-mode-live" value="live" style="accent-color:#16A34A">
+          <label id="nb-mode-live-label" style="display:flex;align-items:center;gap:10px;padding:10px 14px;border:2px solid var(--border);border-radius:8px;cursor:pointer;background:var(--surface)">
+            <input type="radio" name="nb-mode" id="nb-mode-live" value="live" onchange="setNbMode('live')" style="accent-color:#16A34A">
             <div>
               <div style="font-weight:600;font-size:13px;color:#166534">🔴 Live</div>
               <div style="font-size:11px;color:#15803D">Real orders on LongPort</div>
@@ -1755,10 +1755,7 @@ label { display:block; font-size:12px; font-weight:600; color:var(--text-seconda
 /* ════════════════════════════════════════════════════════════════════════════
    QuantX Deployer — Frontend
    ════════════════════════════════════════════════════════════════════════════ */
-if (window.location.protocol === 'file:') {
-  window.location.replace('http://127.0.0.1:8080/');
-}
-const API = window.location.protocol === 'file:' ? 'http://127.0.0.1:8080' : '';
+const API = '';
 let CENTRAL = ''; // Set by loadConfig() after validation — never trust localStorage alone
 let EMAIL = localStorage.getItem('qx_email') || '';
 let UNAME = localStorage.getItem('qx_name') || '';
@@ -2337,7 +2334,7 @@ async function libRunOptimize() {
   let total = 1;
   Object.values(paramGrid).forEach(vals => { total *= vals.length; });
   if (total > 5000) {
-    if (!confirm(`This will run ${total.toLocaleString()} backtests locally. Continue?`)) return;
+    if (!confirm(`This will run ${total.toLocaleString()} backtests. This may take a long time. Continue?`)) return;
   }
   const enableWF = document.getElementById('bt-opt-wf')?.checked ?? true;
   const enableMC = document.getElementById('bt-opt-mc')?.checked ?? true;
@@ -2382,7 +2379,6 @@ async function libRunOptimize() {
         param_grid: paramGrid, initial_capital: cap,
         limit: _btLimit, commission_pct: commPct, slippage_pct: slipPct,
         enable_walk_forward: enableWF, enable_monte_carlo: enableMC,
-        top_n: 200,
         email: EMAIL || '',
       })
     });
@@ -2402,7 +2398,7 @@ async function libRunOptimize() {
         let evt; try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
         if (evt.type === 'start')    setP(0, evt.total||total, evt.message||'Starting...');
         else if (evt.type === 'progress') setP(evt.done||0, evt.total||total, evt.message||null);
-        else if (evt.type === 'complete') { lastData = evt; setP(evt.total_results||total, evt.total_results||total, evt.message||'Done!'); }
+        else if (evt.type === 'complete') { lastData = evt; setP(evt.total_results||total, evt.total_results||total, 'Done!'); }
         else if (evt.type === 'error') throw new Error(evt.message||'Optimization error');
       }
     }
@@ -2745,6 +2741,7 @@ async function onboardStartDownload() {
 /* ═══════════════════ BOTS ═══════════════════ */
 let _botFilter = 'all';
 let _botSearch = '';
+let _runningStrategyIds = new Set();
 
 let _loadBotsInProgress = false;
 async function loadBots() {
@@ -2770,10 +2767,18 @@ async function loadBots() {
       // Don't revert running state if deployed within last 10s (process may still be starting)
       if (!recentDeploy || sd.lp_running) LP_BOT_RUNNING = sd.lp_running || false;
       BOT_RUNNING = LP_BOT_RUNNING;
-      // Propagate dry_run flag onto each active strategy for badge rendering
+      const statusIds = Array.isArray(sd.active_strategy_ids)
+        ? sd.active_strategy_ids
+        : (sd.active_strategy_id ? [sd.active_strategy_id] : USER_STRATEGIES.filter(s => s.is_active).map(s => s.strategy_id));
+      const runningIds = new Set(statusIds);
+      _runningStrategyIds = LP_BOT_RUNNING ? runningIds : new Set();
+      USER_STRATEGIES.forEach(s => {
+        s._is_running = LP_BOT_RUNNING && _runningStrategyIds.has(s.strategy_id);
+      });
+      // Propagate dry_run flag onto each running strategy for badge rendering
       if (sd.dry_run !== undefined) {
         for (const s of USER_STRATEGIES) {
-          if (s.is_active) s.dry_run = sd.dry_run;
+          if (s._is_running) s.dry_run = sd.dry_run;
         }
       }
       console.log('[STATUS] LP:', LP_BOT_RUNNING, 'recentDeploy:', recentDeploy);
@@ -2788,9 +2793,9 @@ function renderBots() {
   const tbody = document.getElementById('bots-tbody');
   const empty = document.getElementById('bots-empty');
   let list = USER_STRATEGIES;
-  if (_botFilter === 'live') list = list.filter(s => s.is_active && !s.is_dry_run && !s.dry_run);
-  if (_botFilter === 'dry') list = list.filter(s => s.is_active && (s.is_dry_run || s.dry_run));
-  if (_botFilter === 'off') list = list.filter(s => !s.is_active);
+  if (_botFilter === 'live') list = list.filter(s => s._is_running && !s.dry_run);
+  if (_botFilter === 'dry') list = list.filter(s => s._is_running && s.dry_run);
+  if (_botFilter === 'off') list = list.filter(s => !s._is_running);
   if (_botSearch) list = list.filter(s => ((s.strategy_name||'') + (s.symbol||'') + (s.library_id||'')).toLowerCase().includes(_botSearch.toLowerCase()));
 
   if (list.length === 0 && USER_STRATEGIES.length === 0) { tbody.innerHTML = ''; empty.style.display = ''; return; }
@@ -2798,7 +2803,7 @@ function renderBots() {
   empty.style.display = 'none';
 
   // Stats
-  const active = USER_STRATEGIES.filter(s => s.is_active && LP_BOT_RUNNING).length;
+  const active = USER_STRATEGIES.filter(s => s._is_running).length;
   document.getElementById('bs-total').textContent = USER_STRATEGIES.length;
   document.getElementById('bs-active').textContent = active;
   const rets = USER_STRATEGIES.map(s => (s.backtest_results || {}).total_return_pct).filter(v => typeof v === 'number');
@@ -2913,11 +2918,17 @@ async function deleteRowBot(sid) {
 }
 
 let _deployedAt = 0; // timestamp of last deploy
+let _deployInProgress = false;
 
 function _renderDeployBtn(s) {
-  const isRunning = LP_BOT_RUNNING && s.is_active;
+  const isRunning = !!s._is_running;
   if (s._toggling) return `<button class="deploy-btn deploy-btn-loading" disabled>\u27F3 ${s._toggling === 'deploy' ? 'Deploying...' : 'Stopping...'}</button>`;
   const isDry = s.is_dry_run || s.dry_run;
+  if (!isRunning) {
+    const dryBtn = `<button style="background:#6D28D9;color:white;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',true,true)">\uD83E\uDDEA Deploy (Dry)</button>`;
+    const liveBtn = `<button style="background:var(--green);color:white;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',true,false)">\u25B6 Deploy (Live)</button>`;
+    return `<div style="display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap">${dryBtn}${liveBtn}</div>`;
+  }
   if (isRunning) {
     const badge = isDry
       ? ' <span style="background:#EDE9FE;color:#6D28D9;padding:1px 5px;border-radius:4px;font-size:10px;margin-left:4px">DRY</span>'
@@ -2933,36 +2944,31 @@ function _renderDeployBtn(s) {
 }
 
 let _pendingDeploySid = null;
-let _pendingDeployDryRun = false;
+let _pendingDeployDryRun = null;
 
-function _refreshDeployControls(sid) {
-  const s = USER_STRATEGIES.find(x => x.strategy_id === sid);
-  const cell = document.getElementById('btn-' + sid);
-  if (cell && s) cell.innerHTML = _renderDeployBtn(s);
-  if (_currentBot && _currentBot.strategy_id === sid) updateBdToggleBtn();
-}
-
-function _renderBotDetailDeployActions(s) {
-  const isRunning = LP_BOT_RUNNING && s.is_active;
-  if (s._toggling) {
-    return `<button class="deploy-btn deploy-btn-loading" disabled>\u27F3 ${s._toggling === 'deploy' ? 'Deploying...' : 'Stopping...'}</button>`;
-  }
-  if (isRunning) return _renderDeployBtn(s);
-  return `<div style="display:flex;align-items:center;gap:8px">
-    <button style="background:#6D28D9;color:white;border:none;padding:8px 13px;border-radius:6px;cursor:pointer;font-size:13px;font-family:inherit" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',true,true)">\uD83E\uDDEA Deploy Dry</button>
-    <button style="background:var(--green);color:white;border:none;padding:8px 13px;border-radius:6px;cursor:pointer;font-size:13px;font-family:inherit" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',true,false)">\u25B6 Deploy Live</button>
-  </div>`;
+function botBacktestCapital(bot) {
+  if (!bot) return 10000;
+  const bt = bot.backtest_results || {};
+  const metrics = bt.metrics || {};
+  const cond = bot.conditions || {};
+  const cap = bt.initial_capital ?? metrics.initial_capital ?? cond.capital ?? bot.allocation ?? (bot.risk || {}).capital ?? 10000;
+  const parsed = parseFloat(cap);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 10000;
 }
 
 async function toggleBot(sid, active, dryRunOverride = null) {
   const s = USER_STRATEGIES.find(x => x.strategy_id === sid);
   if (!s) return;
+  if (active && _deployInProgress) {
+    showToast('Another deploy is already running. Please wait a moment.', 'info');
+    return;
+  }
   // Mode is baked into the bot — read from is_dry_run field
-  const dryRun = dryRunOverride === null ? !!(s.is_dry_run) : !!dryRunOverride;
+  const dryRun = dryRunOverride === null ? !!(s.is_dry_run || s.dry_run) : !!dryRunOverride;
   const broker = s.broker || 'longport';
   const cell = document.getElementById('btn-' + sid);
   s._toggling = active ? 'deploy' : 'stop';
-  _refreshDeployControls(sid);
+  if (cell) cell.innerHTML = _renderDeployBtn(s);
   try {
     if (active) {
       // Lot size guard — warn before deploy if lots < minimum board lot
@@ -2988,7 +2994,7 @@ async function toggleBot(sid, active, dryRunOverride = null) {
             );
             if (!proceed) {
               s._toggling = false;
-              _refreshDeployControls(sid);
+              if (cell) cell.innerHTML = _renderDeployBtn(s);
               openBotDetail(sid);  // open settings so student can fix it
               showBdTab('settings');
               return;
@@ -2996,22 +3002,19 @@ async function toggleBot(sid, active, dryRunOverride = null) {
           }
         } catch(e) { /* lot check failed, proceed anyway */ }
       }
-      await fetch(API + '/api/strategy/' + encodeURIComponent(sid) + '/toggle?active=true', { method: 'PUT' });
-      // Check for open positions before live deploys. Dry deploy never touches live orders.
-      if (!dryRun) {
-        try {
-          const ck = await fetch(API + '/api/deploy/check?email=' + encodeURIComponent(EMAIL));
-          const cd = await ck.json();
-          if (cd.has_open_positions) {
-            _pendingDeploySid = sid;
-            _pendingDeployDryRun = dryRun;
-            showRedeployModal(cd);
-            s._toggling = false;
-            _refreshDeployControls(sid);
-            return;
-          }
-        } catch(e) { /* check failed, proceed with normal deploy */ }
-      }
+      // Check for open positions before deploying
+      try {
+        const ck = await fetch(API + '/api/deploy/check?email=' + encodeURIComponent(EMAIL));
+        const cd = await ck.json();
+        if (cd.has_open_positions) {
+          _pendingDeploySid = sid;
+          _pendingDeployDryRun = dryRun;
+          showRedeployModal(cd);
+          s._toggling = false;
+          if (cell) cell.innerHTML = _renderDeployBtn(s);
+          return;
+        }
+      } catch(e) { /* check failed, proceed with normal deploy */ }
       await _executeDeploy(sid, '/api/deploy', dryRun);
     } else {
       const sr = await fetch(API + '/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL, broker: broker }) });
@@ -3020,15 +3023,18 @@ async function toggleBot(sid, active, dryRunOverride = null) {
       LP_BOT_RUNNING = false;
       BOT_RUNNING = LP_BOT_RUNNING;
       s.is_active = false;
+      s._is_running = false;
+      _runningStrategyIds.delete(sid);
+      USER_STRATEGIES.forEach(x => { x._is_running = false; });
       showToast('Bot stopped (' + broker + ')', 'info');
       s._toggling = false;
-      _refreshDeployControls(sid);
+      if (cell) cell.innerHTML = _renderDeployBtn(s);
       setTimeout(loadBots, 2000);
     }
   } catch (e) {
     showToast(e.message, 'error');
     s._toggling = false;
-    _refreshDeployControls(sid);
+    if (cell) cell.innerHTML = _renderDeployBtn(s);
   }
 }
 
@@ -3049,7 +3055,10 @@ async function executeRedeploy(mode) {
   closeModal('redeploy-modal');
   const endpoint = mode === 'close' ? '/api/deploy/close-and-redeploy' : '/api/deploy';
   if (mode === 'close') showToast('Closing positions and redeploying...', 'info');
-  await _executeDeploy(_pendingDeploySid, endpoint, _pendingDeployDryRun);
+  const s = USER_STRATEGIES.find(x => x.strategy_id === _pendingDeploySid);
+  const dryRun = _pendingDeployDryRun === null ? !!(s && (s.is_dry_run || s.dry_run)) : !!_pendingDeployDryRun;
+  _pendingDeployDryRun = null;
+  await _executeDeploy(_pendingDeploySid, endpoint, dryRun);
 }
 
 const DEPLOY_MESSAGES = [
@@ -3129,31 +3138,86 @@ function _hideDeployProgress(sid) {
 async function _executeDeploy(sid, endpoint, dryRun=false) {
   const s = USER_STRATEGIES.find(x => x.strategy_id === sid);
   if (!s) return;
+  if (_deployInProgress) {
+    showToast('Another deploy is already running. Please wait a moment.', 'info');
+    return;
+  }
   const broker = s.broker || 'longport';
   const cell = document.getElementById('btn-' + sid);
+  _deployInProgress = true;
   s._toggling = 'deploy';
-  _refreshDeployControls(sid);
+  renderBots();
+  if (cell) cell.innerHTML = _renderDeployBtn(s);
+  if (_currentBot && _currentBot.strategy_id === sid) updateBdToggleBtn();
   _showDeployProgress(sid);
   try {
-    const dr = await fetch(API + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL, dry_run: dryRun }) });
+    const dr = await fetch(API + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL, strategy_id: sid, dry_run: dryRun }) });
     if (!dr.ok) { const dd = await dr.json(); throw new Error(dd.detail || 'Deploy failed'); }
     const result = await dr.json();
     LP_BOT_RUNNING = true;
     BOT_RUNNING = true;
     s.is_active = true;
-    s.dry_run = result.dry_run;
+    const activeIds = new Set(result.active_strategy_ids || USER_STRATEGIES.filter(x => x.is_active || x.strategy_id === sid).map(x => x.strategy_id));
+    USER_STRATEGIES.forEach(x => {
+      x.is_active = activeIds.has(x.strategy_id);
+      x._is_running = activeIds.has(x.strategy_id);
+    });
+    _runningStrategyIds = activeIds;
+    s.dry_run = result.dry_run !== undefined ? !!result.dry_run : !!dryRun;
     _deployedAt = Date.now();
     const extra = (result.positions_closed && result.positions_closed.length) ? ' (' + result.positions_closed.length + ' positions closed)' : '';
     _deploySuccess(sid, 'Bot deployed (longport)' + extra);
     showToast('Bot deployed (longport)' + extra, 'success');
     s._toggling = false;
-    _refreshDeployControls(sid);
+    _deployInProgress = false;
+    if (cell) cell.innerHTML = _renderDeployBtn(s);
+    renderBots();
+    if (_currentBot && _currentBot.strategy_id === sid) updateBdToggleBtn();
     setTimeout(loadBots, 5000);
   } catch (e) {
+    if (e.message === 'Failed to fetch' || e.name === 'TypeError' || e.name === 'AbortError') {
+      for (let i = 0; i < 3; i++) {
+        await new Promise(resolve => setTimeout(resolve, 1200));
+        try {
+          const sr = await fetch(API + '/api/status/' + encodeURIComponent(EMAIL));
+          const sd = await sr.json();
+          if (sd.lp_running) {
+            const ids = Array.isArray(sd.active_strategy_ids)
+              ? sd.active_strategy_ids
+              : (sd.active_strategy_id ? [sd.active_strategy_id] : USER_STRATEGIES.filter(x => x.is_active || x.strategy_id === sid).map(x => x.strategy_id));
+            const activeIds = new Set(ids);
+            LP_BOT_RUNNING = true;
+            BOT_RUNNING = true;
+            USER_STRATEGIES.forEach(x => {
+              x.is_active = activeIds.has(x.strategy_id);
+              x._is_running = activeIds.has(x.strategy_id);
+              if (x._is_running && sd.dry_run !== undefined) x.dry_run = sd.dry_run;
+            });
+            _runningStrategyIds = activeIds;
+            _deployedAt = Date.now();
+            _deploySuccess(sid, 'Bot deployed (longport)');
+            showToast('Bot deployed (longport)', 'success');
+            s._toggling = false;
+            _deployInProgress = false;
+            renderBots();
+            if (_currentBot && _currentBot.strategy_id === sid) updateBdToggleBtn();
+            setTimeout(loadBots, 1500);
+            return;
+          }
+        } catch (_) {}
+      }
+    }
     _deployError(sid, e.message);
     showToast(e.message, 'error');
+    try { await fetch(API + '/api/strategy/' + encodeURIComponent(sid) + '/toggle?active=false', { method: 'PUT' }); } catch (_) {}
+    s.is_active = false;
+    s._is_running = false;
+    _runningStrategyIds.delete(sid);
     s._toggling = false;
-    _refreshDeployControls(sid);
+    _deployInProgress = false;
+    if (cell) cell.innerHTML = _renderDeployBtn(s);
+    renderBots();
+    if (_currentBot && _currentBot.strategy_id === sid) updateBdToggleBtn();
   }
 }
 
@@ -3168,6 +3232,7 @@ function openNewBot() {
   if (lotWarn) lotWarn.textContent = '';
   const lotsInput = document.getElementById('nb-lot-size');
   if (lotsInput) lotsInput.value = '1';
+  setNbMode('dry');
   nbRenderQuicktags(document.getElementById('nb-broker').value || 'longport');
   openModal('newbot-modal');
 }
@@ -3182,7 +3247,7 @@ async function createBot(andDeploy = false) {
   const lots = parseInt(document.getElementById('nb-lot-size')?.value) || 1;
   const broker = document.getElementById('nb-broker').value || 'longport';
   const name = document.getElementById('nb-name').value.trim() || (strat === '__TEST__' ? 'Quick Test ' + sym : strat + ' ' + sym);
-  const isDryRun = document.getElementById('nb-mode-dry')?.checked !== false;
+  const isDryRun = document.querySelector('input[name="nb-mode"]:checked')?.value !== 'live';
   if (!sym) { errEl.textContent = 'Symbol required'; return; }
   if (!EMAIL) { errEl.textContent = 'Set up account on Home page first'; return; }
   const existing = USER_STRATEGIES.find(s => s.strategy_name === name && s.symbol === sym);
@@ -3197,24 +3262,24 @@ async function createBot(andDeploy = false) {
   const sid = stratId + '_' + ts4;
   // Build conditions: use library definition, override params with user inputs
   let conditions = isTest ? {type: 'quick_test'} : (lib ? JSON.parse(JSON.stringify(lib.conditions || {})) : {});
+  conditions.capital = parseFloat(alloc) || 1000;
   if (!isTest && lib && lib.default_params && Object.keys(lib.default_params).length) {
     const userParams = readParamInputs('nb', Object.keys(lib.default_params));
     if (conditions.params) Object.assign(conditions.params, userParams);
     else conditions.params = userParams;
   }
   try {
-    const allocation = parseFloat(alloc) || 10000;
     const payload = {
       email: EMAIL, strategy_id: sid, strategy_name: name, symbol: sym,
       arena: sym.endsWith('.HK') ? 'HK' : sym.endsWith('.SI') ? 'SG' : 'US',
       timeframe: tf,
       conditions: conditions,
-      exit_rules: {}, risk: isTest ? {lots: 100, tp_pct: 1, sl_pct: 2, capital: allocation} : Object.assign({}, lib ? lib.default_risk || {} : {}, {lots, capital: allocation}),
-      allocation: allocation,
+      exit_rules: {}, risk: isTest ? {lots: 100, tp_pct: 1, sl_pct: 2} : Object.assign({}, lib ? lib.default_risk || {} : {}, {lots}),
       is_active: false, mode: 'library', library_id: isTest ? 'QUICK_TEST' : strat,
       custom_script: '',
       broker: broker,
       is_dry_run: isDryRun,
+      allocation: parseFloat(alloc) || 1000,
     };
     const r = await fetch(API + '/api/strategy', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
@@ -3226,7 +3291,7 @@ async function createBot(andDeploy = false) {
     if (andDeploy) {
       try {
         await fetch(API + '/api/strategy/' + encodeURIComponent(sid) + '/toggle?active=true', { method: 'PUT' });
-        const dr = await fetch(API + '/api/deploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL, dry_run: isDryRun }) });
+        const dr = await fetch(API + '/api/deploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL, strategy_id: sid, dry_run: isDryRun }) });
         const dd = await dr.json();
         if (!dr.ok) { showToast('Created but deploy failed: ' + (dd.detail || ''), 'error'); }
         else { BOT_RUNNING = true; showToast('Bot deployed: ' + name, 'success'); }
@@ -3255,6 +3320,11 @@ function setNbMode(mode) {
   if (liveLabel) {
     liveLabel.style.borderColor = !isDry ? '#16A34A' : 'var(--border)';
     liveLabel.style.background = !isDry ? '#F0FDF4' : 'var(--surface)';
+  }
+  const deployBtn = document.getElementById('nb-deploy-btn');
+  if (deployBtn) {
+    deployBtn.textContent = isDry ? 'Create & Deploy Dry' : 'Create & Deploy Live';
+    deployBtn.style.background = isDry ? '#6D28D9' : 'var(--green)';
   }
 }
 
@@ -3294,19 +3364,6 @@ async function cloneBot(sid, newIsDry) {
 }
 
 /* ═══════════════════ BOT DETAIL ═══════════════════ */
-function getBotAllocation(b) {
-  const cond = b.conditions || {};
-  const params = cond.params || {};
-  const risk = b.risk || {};
-  const bt = b.backtest_results || {};
-  const direct = risk.capital || risk.allocation || cond.capital || params.capital || bt.initial_capital;
-  if (direct) return Number(direct);
-  const saved = Number(b.allocation || 0);
-  const m = (b.strategy_name || '').match(/-\s*(\d+(?:\.\d+)?)\s*k\b/i);
-  if (m && (!saved || saved === 10000)) return Math.round(Number(m[1]) * 1000);
-  return saved || 10000;
-}
-
 function openBotDetail(sid) {
   _currentBot = USER_STRATEGIES.find(s => s.strategy_id === sid);
   if (!_currentBot) return;
@@ -3329,7 +3386,7 @@ function openBotDetail(sid) {
   // Settings fields
   document.getElementById('bd-set-name').value = _currentBot.strategy_name || '';
   document.getElementById('bd-set-symbol').value = _currentBot.symbol || '';
-  document.getElementById('bd-set-alloc').value = getBotAllocation(_currentBot);
+  document.getElementById('bd-set-alloc').value = botBacktestCapital(_currentBot);
   document.getElementById('bd-set-sl').value = (_currentBot.risk || {}).sl_pct || 5;
   document.getElementById('bd-set-tp').value = (_currentBot.risk || {}).tp_pct || 10;
   const lots = (_currentBot.risk && _currentBot.risk.lots) || 1;
@@ -3433,7 +3490,7 @@ function renderBdStrategy() {
     ['Direction', cond.direction || b.direction || 'long'],
     ['Stop Loss', sl + (sl === '--' ? '' : '%')],
     ['Take Profit', tp + (tp === '--' ? '' : '%')],
-    ['Capital', '$' + getBotAllocation(b).toLocaleString()],
+    ['Capital', '$' + botBacktestCapital(b).toLocaleString()],
   ];
   infoItems.forEach(([label, val]) => {
     html += '<div style="background:var(--surface-2);border-radius:6px;padding:8px 10px">'
@@ -3518,7 +3575,7 @@ function bdEditInStudio() {
   STUDIO.risk = {
     stop_loss_pct: cond.stop_loss_pct || (b.risk && b.risk.sl_pct) || 3,
     take_profit_pct: cond.take_profit_pct || (b.risk && b.risk.tp_pct) || 8,
-    capital: getBotAllocation(b),
+    capital: botBacktestCapital(b),
     trailing_stop_enabled: cond.trailing_stop_enabled || false,
     trailing_stop_pct: cond.trailing_stop_pct || 2,
   };
@@ -3538,7 +3595,7 @@ async function loadBotLiveTrades() {
   // Update mode badge in header
   const modeBadge = document.getElementById('bd-mode-badge');
   if (modeBadge) {
-    if (_currentBot.is_active) {
+    if (_currentBot._is_running) {
       modeBadge.style.display = '';
       modeBadge.innerHTML = isDry
         ? '<span style="background:#EDE9FE;color:#6D28D9;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600">🧪 Dry Run</span>'
@@ -3598,7 +3655,7 @@ async function loadBotLiveTrades() {
 }
 
 function _renderLiveMetrics({ trades, sells, totalPnl } = {}) {
-  const allocation = getBotAllocation(_currentBot);
+  const allocation = botBacktestCapital(_currentBot);
   if (!trades || trades.length === 0) {
     // Clear to backtest data or dashes
     const bt = _currentBot.backtest_results || {};
@@ -3745,14 +3802,7 @@ async function loadBotLog() {
     const el = document.getElementById('bd-log-content');
     const raw = (d.lines ? d.lines.join('\n') : d.logs || d.log || 'No logs available');
     const fnEl = document.getElementById('bd-log-filename');
-    if (fnEl && d.filename) {
-      fnEl.textContent = '\u2B07 ' + d.filename;
-      fnEl.style.display = '';
-      fnEl._downloadUrl = API + '/api/logs/' + encodeURIComponent(EMAIL) + '/' + encodeURIComponent(_currentBot.strategy_id) + '/download';
-    } else if (fnEl) {
-      fnEl.style.display = 'none';
-      fnEl._downloadUrl = '';
-    }
+    if (fnEl && d.filename) { fnEl.textContent = '\uD83D\uDCC4 ' + d.filename; fnEl.style.display = ''; fnEl._path = d.filename; }
     // Color-code log levels
     el.innerHTML = raw.split('\n').map(line => {
       if (line.includes('[ERROR]') || line.includes('ERROR')) return `<span style="color:#F87171">${esc(line)}</span>`;
@@ -3767,17 +3817,16 @@ async function loadBotLog() {
 }
 function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-function downloadBotLog() {
+function copyLogFilename() {
   const el = document.getElementById('bd-log-filename');
-  const url = el?._downloadUrl || '';
-  if (!url) { showToast('No log file available yet', 'info', 2000); return; }
-  window.location.href = url;
+  const path = el?._path || '';
+  if (path) { navigator.clipboard.writeText(path); showToast('Copied: ' + path, 'info', 2000); }
 }
 
 function updateBdToggleBtn() {
   const el = document.getElementById('bd-toggle-btn');
   if (!el || !_currentBot) return;
-  el.innerHTML = _renderBotDetailDeployActions(_currentBot);
+  el.innerHTML = _renderDeployBtn(_currentBot);
   // Refresh mode badge
   const modeBadge = document.getElementById('bd-mode-badge');
   if (modeBadge) {
@@ -3807,16 +3856,17 @@ async function saveBotSettings() {
     if (editedParams) {
       updatedConditions.params = editedParams;
     }
-    const allocation = parseFloat(alloc) || getBotAllocation(_currentBot);
     const r = await fetch(API + '/api/strategy', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         email: EMAIL, strategy_id: _currentBot.strategy_id, strategy_name: name, symbol: sym,
         arena: sym.endsWith('.HK') ? 'HK' : sym.endsWith('.SI') ? 'SG' : 'US',
         timeframe: _currentBot.timeframe || '1day', conditions: updatedConditions,
-        exit_rules: _currentBot.exit_rules || {}, risk: { ..._currentBot.risk, sl_pct: parseFloat(document.getElementById('bd-set-sl').value) || 5, tp_pct: parseFloat(document.getElementById('bd-set-tp').value) || 10, lots: parseInt(document.getElementById('bd-set-lots') ? document.getElementById('bd-set-lots').value : '1') || 1, capital: allocation },
-        allocation: allocation,
-        is_active: _currentBot.is_active, mode: _currentBot.mode || 'library', library_id: _currentBot.library_id || '', broker: _currentBot.broker || 'longport', is_dry_run: !!_currentBot.is_dry_run
+        exit_rules: _currentBot.exit_rules || {}, risk: { ..._currentBot.risk, sl_pct: parseFloat(document.getElementById('bd-set-sl').value) || 5, tp_pct: parseFloat(document.getElementById('bd-set-tp').value) || 10, lots: parseInt(document.getElementById('bd-set-lots') ? document.getElementById('bd-set-lots').value : '1') || 1 },
+        is_active: _currentBot.is_active, mode: _currentBot.mode || 'library', library_id: _currentBot.library_id || '',
+        custom_script: _currentBot.custom_script || '', broker: _currentBot.broker || 'longport',
+        is_dry_run: !!(_currentBot.is_dry_run || _currentBot.dry_run),
+        allocation: parseFloat(alloc) || botBacktestCapital(_currentBot)
       })
     });
     if (!r.ok) throw new Error((await r.json()).detail || 'Save failed');
@@ -3827,8 +3877,7 @@ async function saveBotSettings() {
     document.getElementById('bd-symbol').textContent = sym;
     _currentBot.strategy_name = name;
     _currentBot.symbol = sym;
-    _currentBot.allocation = allocation;
-    _currentBot.risk = { ...(_currentBot.risk || {}), capital: allocation };
+    _currentBot.allocation = parseFloat(alloc) || botBacktestCapital(_currentBot);
   } catch (e) { msg.textContent = e.message; msg.style.color = 'var(--red)'; }
 }
 
@@ -4169,7 +4218,6 @@ function clearSavedBacktests() {
 function createBotFromBacktest() {
   const sym = document.getElementById('bt-symbol').value;
   const strat = document.getElementById('bt-strategy').value;
-  const cap = parseFloat(document.getElementById('bt-capital')?.value) || 10000;
   // Read current param inputs from backtester before opening modal
   const lib = (LIB_CACHE || []).find(l => l.id === strat);
   const currentParams = (lib && lib.default_params && Object.keys(lib.default_params).length)
@@ -4180,7 +4228,6 @@ function createBotFromBacktest() {
     document.getElementById('nb-symbol').value = sym;
     document.getElementById('nb-strategy').value = strat;
     document.getElementById('nb-name').value = strat + ' ' + sym;
-    document.getElementById('nb-alloc').value = cap;
     nbSelectSymbol(sym, '');
     // Trigger strategy change to render params, then fill with backtest values
     nbOnStrategyChange(strat);
@@ -5902,7 +5949,8 @@ async function studioDeployFromResults() {
           slippage_pct: STUDIO.slippage_pct ?? 0.05,
         },
         exit_rules:{}, risk:{lots: STUDIO._lotSize || 1, sl_pct:STUDIO.risk.stop_loss_pct, tp_pct:STUDIO.risk.take_profit_pct},
-        is_active:true, mode:'studio', library_id:'', broker:'longport'})
+        is_active:true, mode:'studio', library_id:'', broker:'longport',
+        allocation: STUDIO.risk.capital || 10000})
     });
     showToast('Strategy saved! Go to Bots to deploy.', 'success');
     navigate('bots');

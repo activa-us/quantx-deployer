@@ -79,7 +79,8 @@ def generate_ibkr_bot(email: str, strategies: list[dict], credentials: dict,
 
 # ── Simple bot generators (for test orders) ─────────────────────────────────
 
-def generate_simple_lp_bot(email: str, symbol: str, credentials: dict) -> tuple[str, str]:
+def generate_simple_lp_bot(email: str, symbol: str, credentials: dict,
+                           dry_run: bool = False) -> tuple[str, str]:
     """Generate a simple LongPort bot that places one test order.
     Returns (script_path, log_path)."""
     BOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -93,6 +94,7 @@ def generate_simple_lp_bot(email: str, symbol: str, credentials: dict) -> tuple[
     content = content.replace('__CENTRAL_API_URL__', credentials.get("central_api_url", ""))
     content = content.replace('__LOG_DIR__', str(LOGS_DIR).replace("\\", "/"))
     content = content.replace('__LOG_NAME__', log_name)
+    content = content.replace('__DRY_RUN__', 'True' if dry_run else 'False')
     script_path.write_text(content, encoding="utf-8")
     # Verify template was filled correctly
     assert email in script_path.read_text(encoding="utf-8"), "Template fill failed for LP bot"
@@ -445,6 +447,7 @@ def generate_lp_master_bot(email: str, strategies: list[dict],
             "library_id": library_id,
             "conditions": conds,
             "risk": risk,
+            "allocation": s.get("allocation", conds.get("capital", 10000)),
             "has_short": bool(conds.get("entry_short")),
         })
 

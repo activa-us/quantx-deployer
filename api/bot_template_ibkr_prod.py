@@ -84,6 +84,13 @@ def build_contract():
         if EXCHANGE == 'SEHK': return Stock(SYMBOL, 'SEHK', 'HKD')
         elif EXCHANGE == 'SGX': return Stock(SYMBOL, 'SGX', 'SGD')
         else: return Stock(SYMBOL, 'SMART', 'USD')
+    elif SEC_TYPE == 'CMDTY':
+        c = Contract()
+        c.symbol = SYMBOL
+        c.secType = 'CMDTY'
+        c.exchange = EXCHANGE
+        c.currency = CURRENCY
+        return c
     elif SEC_TYPE == 'CASH':
         return Forex(pair=SYMBOL, currency=CURRENCY)
     elif SEC_TYPE == 'FUT':

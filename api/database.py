@@ -288,13 +288,6 @@ def save_student(email: str, name: str, app_key: str, app_secret: str,
                  access_token: str, central_api_url: str):
     conn = get_db()
     try:
-        existing = conn.execute(
-            "SELECT app_key_enc, app_secret_enc, access_token_enc FROM students WHERE email = ?",
-            (email,),
-        ).fetchone()
-        app_key_enc = encrypt(app_key) if app_key else (existing["app_key_enc"] if existing else "")
-        app_secret_enc = encrypt(app_secret) if app_secret else (existing["app_secret_enc"] if existing else "")
-        access_token_enc = encrypt(access_token) if access_token else (existing["access_token_enc"] if existing else "")
         conn.execute(
             """INSERT INTO students (email, name, app_key_enc, app_secret_enc, access_token_enc, central_api_url)
                VALUES (?, ?, ?, ?, ?, ?)
@@ -304,8 +297,8 @@ def save_student(email: str, name: str, app_key: str, app_secret: str,
                  app_secret_enc=excluded.app_secret_enc,
                  access_token_enc=excluded.access_token_enc,
                  central_api_url=excluded.central_api_url""",
-            (email, name, app_key_enc, app_secret_enc,
-             access_token_enc, central_api_url),
+            (email, name, encrypt(app_key), encrypt(app_secret),
+             encrypt(access_token), central_api_url),
         )
         conn.commit()
     finally:
@@ -338,17 +331,9 @@ def save_strategy(email: str, strategy_id: str, strategy_name: str, symbol: str,
                   risk: dict, is_active: bool = True, mode: str = "library",
                   library_id: str = "", custom_script: str = "",
                   broker: str = "longport", is_dry_run: bool = False,
-                  allocation: float | None = None):
+                  allocation: float = 10000):
     conn = get_db()
     try:
-        if allocation is None:
-            allocation = (
-                risk.get("capital")
-                or risk.get("allocation")
-                or conditions.get("capital")
-                or (conditions.get("params") or {}).get("capital")
-                or 10000
-            )
         conn.execute(
             """INSERT INTO strategies (email, strategy_id, strategy_name, symbol, arena, timeframe,
                                       conditions_json, exit_rules_json, risk_json, is_active,
@@ -372,7 +357,7 @@ def save_strategy(email: str, strategy_id: str, strategy_name: str, symbol: str,
             (email, strategy_id, strategy_name, symbol, arena, timeframe,
              json.dumps(conditions), json.dumps(exit_rules), json.dumps(risk),
              1 if is_active else 0, mode, library_id, custom_script, broker,
-             1 if is_dry_run else 0, str(allocation)),
+             1 if is_dry_run else 0, allocation),
         )
         conn.commit()
     finally:
@@ -389,15 +374,27 @@ def get_strategies(email: str, active_only: bool = False) -> list[dict]:
         result = []
         for r in rows:
             rk = r.keys()
+            conditions = json.loads(r["conditions_json"])
+            risk = json.loads(r["risk_json"])
+            backtest_results = json.loads(r["backtest_results_json"]) if "backtest_results_json" in rk and r["backtest_results_json"] else None
+            allocation = float(r["allocation"]) if "allocation" in rk and r["allocation"] else 10000
+            if isinstance(backtest_results, dict):
+                bt_cap = backtest_results.get("initial_capital")
+                if bt_cap is None and isinstance(backtest_results.get("metrics"), dict):
+                    bt_cap = backtest_results["metrics"].get("initial_capital")
+                if bt_cap is not None:
+                    allocation = float(bt_cap)
+            elif isinstance(conditions, dict) and conditions.get("capital") is not None:
+                allocation = float(conditions.get("capital"))
             d = {
                 "strategy_id": r["strategy_id"],
                 "strategy_name": r["strategy_name"],
                 "symbol": r["symbol"],
                 "arena": r["arena"],
                 "timeframe": r["timeframe"],
-                "conditions": json.loads(r["conditions_json"]),
+                "conditions": conditions,
                 "exit_rules": json.loads(r["exit_rules_json"]),
-                "risk": json.loads(r["risk_json"]),
+                "risk": risk,
                 "is_active": bool(r["is_active"]),
                 "created_at": r["created_at"],
                 "mode": r["mode"] if "mode" in rk else "library",
@@ -405,8 +402,8 @@ def get_strategies(email: str, active_only: bool = False) -> list[dict]:
                 "custom_script": r["custom_script"] if "custom_script" in rk else "",
                 "broker": r["broker"] if "broker" in rk else "longport",
                 "is_dry_run": (int(r["is_dry_run"]) != 0) if "is_dry_run" in rk and r["is_dry_run"] is not None else False,
-                "allocation": float(r["allocation"]) if "allocation" in rk and r["allocation"] else 10000,
-                "backtest_results": json.loads(r["backtest_results_json"]) if "backtest_results_json" in rk and r["backtest_results_json"] else None,
+                "allocation": allocation,
+                "backtest_results": backtest_results,
                 "live_results": json.loads(r["live_results_json"]) if "live_results_json" in rk and r["live_results_json"] else None,
                 "trade_log": json.loads(r["trade_log_json"]) if "trade_log_json" in rk and r["trade_log_json"] else [],
             }
@@ -644,30 +641,6 @@ def get_broker_credentials(account_id: int) -> dict | None:
 
 
 # ── Backtest result cache ──────────────────────────────────────────────────
-
-def get_primary_broker_credentials(email: str, broker: str = "longport") -> dict | None:
-    """Return decrypted credentials for the preferred account of a broker."""
-    conn = get_db()
-    try:
-        row = conn.execute(
-            """SELECT * FROM broker_accounts
-               WHERE email = ? AND broker = ?
-               ORDER BY is_connected DESC,
-                        CASE account_type WHEN 'paper' THEN 0 ELSE 1 END,
-                        id DESC
-               LIMIT 1""",
-            (email, broker),
-        ).fetchone()
-        if not row:
-            return None
-        d = dict(row)
-        d["app_key"] = decrypt(d.get("app_key_enc", ""))
-        d["app_secret"] = decrypt(d.get("app_secret_enc", ""))
-        d["access_token"] = decrypt(d.get("access_token_enc", ""))
-        return d
-    finally:
-        conn.close()
-
 
 import hashlib
 

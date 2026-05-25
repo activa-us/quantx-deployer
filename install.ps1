@@ -133,7 +133,7 @@ if (-not (Test-Path $pythonExe)) { $pythonExe = $pythonCmd }
 
 $action = New-ScheduledTaskAction `
     -Execute $pythonExe `
-    -Argument "-m api.local_server --host 0.0.0.0 --port 8080" `
+    -Argument "-m uvicorn api.main:app --host 0.0.0.0 --port 8080" `
     -WorkingDirectory $InstallDir
 
 $trigger = New-ScheduledTaskTrigger -AtStartup
@@ -147,7 +147,7 @@ Write-Host "[OK] Scheduled task '$taskName' created (runs on startup)." -Foregro
 
 Write-Host "[*] Starting QuantX Deployer..." -ForegroundColor Yellow
 $proc = Start-Process -FilePath $pythonExe `
-    -ArgumentList "-m api.local_server --host 0.0.0.0 --port 8080" `
+    -ArgumentList "-m uvicorn api.main:app --host 0.0.0.0 --port 8080" `
     -WorkingDirectory $InstallDir `
     -WindowStyle Minimized `
     -PassThru
