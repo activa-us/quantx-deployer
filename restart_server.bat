@@ -15,8 +15,8 @@ set OPTIONS_CACHE_MAX_GB=20
 echo [restart] Stopping the process listening on port %PORT% (if any) ...
 powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort %PORT% -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Write-Host ('[restart]   killing PID ' + $_); Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }"
 
-echo [restart] Stopping old bot runner(s) so the new server spawns fresh ones ...
-powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match '_lp_master\.py' } | ForEach-Object { Write-Host ('[restart]   killing runner PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+echo [restart] Waiting for bot runner(s) to shut down cleanly (they watch the server PID) ...
+powershell -NoProfile -Command "$deadline=(Get-Date).AddSeconds(15); do { $r=@(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match '_lp_master\.py' }); if ($r.Count -eq 0) { Write-Host '[restart]   all runners exited cleanly'; break }; Start-Sleep -Milliseconds 500 } while ((Get-Date) -lt $deadline); $r=@(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match '_lp_master\.py' }); foreach ($p in $r) { Write-Host ('[restart]   force-killing straggler runner PID ' + $p.ProcessId); Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }"
 
 REM Brief pause so Windows releases the port (works non-interactively too).
 ping -n 3 127.0.0.1 >nul
