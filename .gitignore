@@ -24,6 +24,15 @@ __pycache__/
 # Local config
 config.json
 
+# Local utility / one-off scripts that may contain hardcoded credentials
+clean_r2_corrupted.py
+fix*.py
+test_ibkr*.py
+test_lp*.py
+
+# Example env files with real values (keep locally, don't commit)
+.env.railway.example
+
 # Test files
 test_grid.py
 
