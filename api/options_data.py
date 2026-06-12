@@ -32,18 +32,9 @@ import pandas as pd
 log = logging.getLogger("quantx-options-data")
 
 # ── R2 connection (overridable via env vars) ─────────────────────────────────
-R2_ENDPOINT = os.environ.get(
-    "R2_ENDPOINT",
-    "https://7f835882a6c11ee760fe4e96eb8cbef2.r2.cloudflarestorage.com",
-)
-R2_ACCESS_KEY = os.environ.get(
-    "R2_ACCESS_KEY",
-    "c51d8b873c28f70a395c02ce4b72d07d",
-)
-R2_SECRET_KEY = os.environ.get(
-    "R2_SECRET_KEY",
-    "af3f2b632698044bfb2e671954a0d30dae17c4c7e8de27803812f66ecd224b94",
-)
+R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "")
+R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY", "")
+R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
 R2_BUCKET = os.environ.get("R2_BUCKET", "options-data")
 # Slim-data layout: same bucket by default, key-prefixed to avoid colliding with
 # originals. A separate bucket can be used by setting R2_SLIM_BUCKET to a
