@@ -32,18 +32,9 @@ import pandas as pd
 log = logging.getLogger("quantx-options-data")
 
 # ── R2 connection (overridable via env vars) ─────────────────────────────────
-R2_ENDPOINT = os.environ.get(
-    "R2_ENDPOINT",
-    "https://7f835882a6c11ee760fe4e96eb8cbef2.r2.cloudflarestorage.com",
-)
-R2_ACCESS_KEY = os.environ.get(
-    "R2_ACCESS_KEY",
-    "c51d8b873c28f70a395c02ce4b72d07d",
-)
-R2_SECRET_KEY = os.environ.get(
-    "R2_SECRET_KEY",
-    "af3f2b632698044bfb2e671954a0d30dae17c4c7e8de27803812f66ecd224b94",
-)
+R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "")
+R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY", "")
+R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
 R2_BUCKET = os.environ.get("R2_BUCKET", "options-data")
 # Slim-data layout: same bucket by default, key-prefixed to avoid colliding with
 # originals. A separate bucket can be used by setting R2_SLIM_BUCKET to a
@@ -73,6 +64,20 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 _DAY_CACHE_MAX = int(os.environ.get("OPTIONS_DAY_CACHE_MAX", "20"))
 _day_cache: "OrderedDict[tuple, dict]" = OrderedDict()
 _cache_lock = threading.Lock()
+
+# ── On-disk cache size cap ───────────────────────────────────────────────────
+# Hard ceiling on the total size of {CACHE_DIR}/**/*.parquet. When a freshly
+# downloaded day pushes the cache past this, the oldest files (by mtime) are
+# evicted until the cache is back under the low-water mark. Prevents the
+# options_cache from filling the disk (a full disk crashes the live bots, which
+# can no longer write their trade logs). Default 20 GB; override via
+# OPTIONS_CACHE_MAX_GB (set to 0 to disable eviction entirely).
+_CACHE_MAX_GB = float(os.environ.get("OPTIONS_CACHE_MAX_GB", "20"))
+_CACHE_MAX_BYTES = int(_CACHE_MAX_GB * 1024 ** 3)
+# Evict down to this fraction of the cap so we don't delete a file on every
+# single write once we're hovering at the ceiling.
+_CACHE_LOW_WATER = 0.90
+_evict_lock = threading.Lock()
 
 # Columns the engine actually uses. R2 files have 31 cols including 18 exotic
 # greeks (rho, vanna, charm, vomma, veta, vera, speed, zomma, color, ultima, d1,
@@ -165,6 +170,12 @@ def _ensure_day_cached(symbol: str, date_str: str) -> Path:
         df.to_parquet(cf, index=False, compression="zstd")
         log.info("[cache] Saved %s %s (%.1fMB)", symbol, date_str,
                  cf.stat().st_size / 1024 / 1024)
+        # Keep the on-disk cache under its size cap (evicts oldest days first).
+        # Best-effort: never fail a cache write because eviction hit a snag.
+        try:
+            enforce_cache_limit()
+        except Exception as ev:
+            log.warning("[cache] enforce_cache_limit failed: %s", ev)
     except Exception as e:
         log.error("[cache] FAILED to cache %s %s: %s: %s",
                   symbol, date_str, type(e).__name__, e)
@@ -455,6 +466,82 @@ def clear_cache(symbol: Optional[str] = None) -> dict:
         except OSError:
             pass  # non-empty or already gone
     return {"deleted_files": deleted, "freed_mb": round(freed / 1024 / 1024, 2)}
+
+
+def enforce_cache_limit(max_bytes: Optional[int] = None) -> dict:
+    """Evict oldest cached parquet files until the on-disk cache is under the cap.
+
+    Files are removed oldest-first by modification time (effectively the order
+    they were downloaded), so the most recently fetched days survive. When the
+    cache exceeds ``max_bytes`` it is trimmed down to ``_CACHE_LOW_WATER`` of the
+    cap to avoid evicting on every subsequent write. A cap of 0 disables eviction.
+
+    Returns {evicted_files, freed_mb, size_mb_before, size_mb_after}. Safe to call
+    on every cache write; it's a cheap stat() walk when already under the cap.
+    """
+    cap = _CACHE_MAX_BYTES if max_bytes is None else max_bytes
+    if cap <= 0 or not CACHE_DIR.exists():
+        return {"evicted_files": 0, "freed_mb": 0.0, "size_mb_before": 0.0, "size_mb_after": 0.0}
+
+    # Serialize evictions so concurrent writers don't double-count / double-delete.
+    with _evict_lock:
+        files = []
+        total = 0
+        for sd in CACHE_DIR.iterdir():
+            if not sd.is_dir():
+                continue
+            for f in sd.glob("*.parquet"):
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                files.append((st.st_mtime, st.st_size, f))
+                total += st.st_size
+
+        before = total
+        if total <= cap:
+            return {"evicted_files": 0, "freed_mb": 0.0,
+                    "size_mb_before": round(before / 1024 / 1024, 2),
+                    "size_mb_after": round(before / 1024 / 1024, 2)}
+
+        target = int(cap * _CACHE_LOW_WATER)
+        files.sort(key=lambda t: t[0])  # oldest mtime first
+
+        evicted = 0
+        freed = 0
+        for _mtime, size, f in files:
+            if total <= target:
+                break
+            sym_up = f.parent.name.upper()
+            date_str = f.stem
+            try:
+                f.unlink()
+            except OSError as e:
+                log.warning("[cache] eviction failed to delete %s: %s", f, e)
+                continue
+            total -= size
+            freed += size
+            evicted += 1
+            # Drop any matching in-memory LRU entry (keyed by (symbol, date, ...)).
+            with _cache_lock:
+                for k in [k for k in _day_cache if k[0] == sym_up and date_str in k]:
+                    _day_cache.pop(k, None)
+
+        # Tidy up any symbol dirs we just emptied.
+        for sd in CACHE_DIR.iterdir():
+            if sd.is_dir() and not any(sd.iterdir()):
+                try:
+                    sd.rmdir()
+                except OSError:
+                    pass
+
+        if evicted:
+            log.info("[cache] evicted %d old file(s), freed %.1fMB (%.1fGB -> %.1fGB, cap %.0fGB)",
+                     evicted, freed / 1024 / 1024,
+                     before / 1024 ** 3, total / 1024 ** 3, cap / 1024 ** 3)
+        return {"evicted_files": evicted, "freed_mb": round(freed / 1024 / 1024, 2),
+                "size_mb_before": round(before / 1024 / 1024, 2),
+                "size_mb_after": round(total / 1024 / 1024, 2)}
 
 
 def preload_cache(symbol: str, start_date: str, end_date: str,
