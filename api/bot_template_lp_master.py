@@ -39,7 +39,9 @@ APP_KEY        = '__APP_KEY__'
 APP_SECRET     = '__APP_SECRET__'
 ACCESS_TOKEN   = '__ACCESS_TOKEN__'
 
-DRY_RUN    = __DRY_RUN__   # True = simulate orders, no real trades
+DRY_RUN    = __DRY_RUN__   # True = ALL strategies dry (no trade connection needed).
+                           # Each strategy also carries its own 'dry_run' flag —
+                           # live and dry bots can run side by side in one process.
 
 LOG_DIR    = '__LOG_DIR__'
 TRADES_DIR = '__TRADES_DIR__'
@@ -108,9 +110,11 @@ logging.basicConfig(
     ],
     force=True,
 )
+# Use a named logger that PROPAGATES to the root handlers configured above.
+# (propagate=False on a handler-less logger silently discards every record —
+# the bot would run with an empty log file.)
 logger = logging.getLogger('quantx-lp-master')
-# Prevent log propagation to root which would cause double logging
-logger.propagate = False
+logger.propagate = True
 
 _shutdown = threading.Event()
 
@@ -415,6 +419,7 @@ class StrategyState:
         if self.tp_pct > 1: self.tp_pct /= 100
         if self.sl_pct > 1: self.sl_pct /= 100
         self.has_short = bool(config.get('has_short', False))
+        self.dry = bool(config.get('dry_run', DRY_RUN))
 
         # Position state: first check injected initial state, then state file
         self.current_position = int(config.get('initial_position', 0))
@@ -469,6 +474,7 @@ class GridState:
         self.arena     = config.get('arena', 'HK')
         self.trade_ctx = trade_ctx
         self.quote_ctx = quote_ctx
+        self.dry       = bool(config.get('dry_run', DRY_RUN))
 
         params = config.get('conditions', {}).get('params', {})
         self.grid_levels_n    = int(params.get('grid_levels', 4))
@@ -643,7 +649,7 @@ class GridState:
 
     def _flatten(self, reason):
         logger.info('[%s] FLATTEN: %s', self.sid, reason)
-        if DRY_RUN:
+        if self.dry:
             logger.info('[%s] [DRY RUN] Would cancel all orders and market sell %d shares',
                         self.sid, self.position_qty)
             self.buy_levels = []
@@ -687,7 +693,7 @@ class GridState:
 
     def _submit_limit(self, action, qty, price):
         """Submit a limit order. Returns order_id string, or '' on failure."""
-        if DRY_RUN:
+        if self.dry:
             fake_oid = f'DRY_{self.sid}_{action}_{datetime.now(timezone.utc):%H%M%S%f}'
             logger.info('[DRY RUN][%s] SIMULATED LIMIT %s %d %s @ %.4f → oid=%s',
                         self.sid, action, qty, self.symbol, price, fake_oid)
@@ -723,11 +729,25 @@ class GridState:
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
+    have_credentials = bool(APP_KEY and APP_SECRET and ACCESS_TOKEN)
+    # Safety gate: a live strategy without credentials can never fire a real
+    # order — downgrade it to dry loudly rather than crash or silently skip.
+    if not have_credentials:
+        for s in STRATEGIES:
+            if not s.get('dry_run', DRY_RUN):
+                logger.error('[%s] LIVE requested but LongPort credentials missing '
+                             '-- FORCED TO DRY RUN', s['strategy_id'])
+                s['dry_run'] = True
+
+    n_live = sum(1 for s in STRATEGIES if not s.get('dry_run', DRY_RUN))
+    n_dry = len(STRATEGIES) - n_live
+    any_live = n_live > 0
+
     logger.info('='*72)
     logger.info('QuantX LongPort Master Bot -- %s', EMAIL)
-    logger.info('Strategies: %d', len(STRATEGIES))
-    if DRY_RUN:
-        logger.info('*** DRY RUN MODE -- no real orders will be placed ***')
+    logger.info('Strategies: %d (%d LIVE / %d dry)', len(STRATEGIES), n_live, n_dry)
+    if not any_live:
+        logger.info('*** ALL STRATEGIES DRY -- no real orders will be placed ***')
     logger.info('='*72)
 
     # LongPort imports
@@ -740,20 +760,20 @@ def main():
         logger.error('longport package not installed')
         return
 
-    have_credentials = bool(APP_KEY and APP_SECRET and ACCESS_TOKEN)
-    if DRY_RUN and not have_credentials:
+    if not have_credentials:
         quote_ctx = DryRunQuoteContext()
         trade_ctx = None
-        logger.warning('DRY RUN: LongPort credentials missing; using simulated quote data')
+        logger.warning('LongPort credentials missing; using simulated quote data')
     else:
         cfg = Config(app_key=APP_KEY, app_secret=APP_SECRET, access_token=ACCESS_TOKEN)
         quote_ctx = QuoteContext(cfg)
-        if DRY_RUN:
+        if not any_live:
             trade_ctx = None
-            logger.info('DRY RUN: QuoteContext connected (TradeContext skipped)')
+            logger.info('All dry: QuoteContext connected (TradeContext skipped)')
         else:
             trade_ctx = TradeContext(cfg)
-            logger.info('LongPort connected (2 connections: quote + trade)')
+            logger.info('LongPort connected (2 connections: quote + trade) -- '
+                        '%d strategy(ies) trading LIVE', n_live)
 
     # ── Classify strategies: signal-based vs grid ──────────────────────────
     # The SIGNAL_FUNCTIONS_BLOCK block defines compute_signals_XXXX for each strategy
@@ -821,10 +841,12 @@ def main():
             logger.warning('[%s] Warmup failed: %s', st.sid, e)
 
     # ── Position reconciliation (signal strategies, live only) ────────────
-    if DRY_RUN:
-        logger.info('DRY RUN: skipping position reconciliation')
-    elif signal_states:
-        logger.info('Reconciling positions with LongPort...')
+    live_signal_states = [st for st in signal_states if not st.dry]
+    if not live_signal_states or not trade_ctx:
+        logger.info('No live signal strategies: skipping position reconciliation')
+    else:
+        logger.info('Reconciling positions with LongPort (%d live strategies)...',
+                    len(live_signal_states))
         try:
             lp_positions = {}
             stock_positions = trade_ctx.stock_positions()
@@ -832,7 +854,7 @@ def main():
                 for p in pos.positions:
                     lp_positions[str(p.symbol)] = int(p.quantity or 0)
             logger.info('LongPort positions: %s', lp_positions)
-            for st in signal_states:
+            for st in live_signal_states:
                 lp_qty = lp_positions.get(st.symbol, 0)
                 if st.current_position == 1 and lp_qty == 0:
                     logger.warning('[%s] State LONG but LP FLAT -- resetting', st.sid)
@@ -855,7 +877,9 @@ def main():
         for gs in grid_states:
             grid_symbol_map.setdefault(gs.symbol, []).append(gs)
 
-        if not DRY_RUN and trade_ctx:
+        # Wire real fill callbacks whenever a trade connection exists; dry grids
+        # use simulated fills with DRY_ order ids that never match tracked ids.
+        if trade_ctx:
             def _on_order_changed(event):
                 if event.status not in (OrderStatus.Filled, OrderStatus.PartialFilled):
                     return
@@ -912,7 +936,7 @@ def main():
             else:
                 limit_price = round(price * (0.998 if action == 'BUY' else 1.002), 2)
 
-            if DRY_RUN:
+            if st.dry:
                 order_id = f'DRY_{st.sid}_{datetime.now(timezone.utc):%H%M%S%f}'
                 logger.info('[DRY RUN][%s] SIMULATED %s %d %s @ %.4f | signal=%s',
                             st.sid, action, st.lot_size, st.symbol, limit_price, signal)
@@ -1040,10 +1064,10 @@ def main():
     bar_t.start()
     hb_t.start()
 
-    mode_str = 'DRY RUN' if DRY_RUN else 'LIVE'
+    mode_str = 'ALL DRY' if not any_live else ('ALL LIVE' if n_dry == 0 else f'MIXED ({n_live} live / {n_dry} dry)')
     logger.info('Bot is %s. %d signal + %d grid strategies, %d symbols, %s.',
                 mode_str, len(signal_states), len(grid_states), len(all_symbols),
-                '1 LP connection (quote only)' if DRY_RUN else '2 LP connections')
+                '2 LP connections' if trade_ctx else '1 LP connection (quote only)')
 
     try:
         while not _shutdown.is_set():

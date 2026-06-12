@@ -396,6 +396,8 @@ def generate_lp_master_bot(email: str, strategies: list[dict],
                            lp_credentials: dict,
                            dry_run: bool = False) -> tuple[str, str]:
     """Generate one LP master bot handling multiple strategies with shared connections.
+    Each strategy carries its own dry_run flag (from is_dry_run); the script-level
+    DRY_RUN means "all strategies dry" and only gates the trade connection.
     Returns (script_path, log_path)."""
     BOTS_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -449,6 +451,8 @@ def generate_lp_master_bot(email: str, strategies: list[dict],
             "risk": risk,
             "allocation": s.get("allocation", conds.get("capital", 10000)),
             "has_short": bool(conds.get("entry_short")),
+            # Per-strategy mode: live and dry bots run side by side in one process
+            "dry_run": bool(s.get("is_dry_run", dry_run)),
         })
 
     # Build strategies list as Python literal
@@ -471,7 +475,8 @@ def generate_lp_master_bot(email: str, strategies: list[dict],
         '__STRATEGY_COUNT__': str(len(strategies_meta)),
         '__STRATEGIES_LIST__': strats_json,
         '__SIGNAL_FUNCTIONS__': "\n".join(signal_functions),
-        '__DRY_RUN__': 'True' if dry_run else 'False',
+        # Script-level flag = "all dry" (gates the trade connection only)
+        '__DRY_RUN__': 'True' if all(m["dry_run"] for m in strategies_meta) else 'False',
     }
 
     for placeholder, value in replacements.items():

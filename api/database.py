@@ -247,6 +247,28 @@ def init_db():
             pass
     except Exception:
         pass
+    # Index for per-email trade aggregations (table can reach 100k+ rows)
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_email_sid ON trades(email, strategy_id)")
+        conn.commit()
+    except Exception:
+        pass
+    # Risk limits table (circuit breaker)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS risk_limits (
+                email TEXT PRIMARY KEY,
+                daily_loss_pct REAL DEFAULT 5.0,
+                max_dd_pct REAL DEFAULT 10.0,
+                enabled INTEGER DEFAULT 1,
+                tripped INTEGER DEFAULT 0,
+                tripped_at TEXT DEFAULT '',
+                tripped_reason TEXT DEFAULT ''
+            )
+        """)
+        conn.commit()
+    except Exception:
+        pass
     conn.close()
 
 
@@ -364,7 +386,11 @@ def save_strategy(email: str, strategy_id: str, strategy_name: str, symbol: str,
         conn.close()
 
 
-def get_strategies(email: str, active_only: bool = False) -> list[dict]:
+def get_strategies(email: str, active_only: bool = False,
+                   include_trade_log: bool = False) -> list[dict]:
+    # trade_log_json can be multiple MB per grid strategy — parsing and
+    # re-serializing it on every list/status poll wedges the server, so it
+    # is excluded unless explicitly requested (detail views read their own row).
     conn = get_db()
     try:
         q = "SELECT * FROM strategies WHERE email = ?"
@@ -405,7 +431,9 @@ def get_strategies(email: str, active_only: bool = False) -> list[dict]:
                 "allocation": allocation,
                 "backtest_results": backtest_results,
                 "live_results": json.loads(r["live_results_json"]) if "live_results_json" in rk and r["live_results_json"] else None,
-                "trade_log": json.loads(r["trade_log_json"]) if "trade_log_json" in rk and r["trade_log_json"] else [],
+                "trade_log": (json.loads(r["trade_log_json"])
+                              if include_trade_log and "trade_log_json" in rk and r["trade_log_json"]
+                              else []),
             }
             result.append(d)
         return result
@@ -496,13 +524,85 @@ def log_trade(email: str, strategy_id: str, symbol: str, side: str,
         conn.close()
 
 
-def get_trades(email: str) -> list[dict]:
+def get_trades(email: str, strategy_id: str = None, limit: int = None) -> list[dict]:
+    conn = get_db()
+    try:
+        sql = "SELECT * FROM trades WHERE email = ?"
+        params: list = [email]
+        if strategy_id:
+            sql += " AND strategy_id = ?"
+            params.append(strategy_id)
+        sql += " ORDER BY timestamp DESC"
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+_BUY_SIDES = ("buy", "bot", "dry_buy", "dry_bot")
+_SELL_SIDES = ("sell", "sld", "dry_sld")
+
+
+def get_trade_aggregates(email: str) -> dict:
+    """Per-strategy P&L/count aggregates computed in SQL — avoids loading the
+    full trades table (can be 100k+ rows) into Python on every status poll."""
     conn = get_db()
     try:
         rows = conn.execute(
-            "SELECT * FROM trades WHERE email = ? ORDER BY timestamp DESC", (email,)
-        ).fetchall()
-        return [dict(r) for r in rows]
+            """SELECT strategy_id,
+                      COUNT(*) AS trades,
+                      SUM(pnl) AS pnl,
+                      SUM(CASE WHEN LOWER(side) IN ('sell','sld','dry_sld') THEN 1 ELSE 0 END) AS closed,
+                      SUM(CASE WHEN LOWER(side) IN ('sell','sld','dry_sld') AND pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                      SUM(CASE WHEN LOWER(side) IN ('sell','sld','dry_sld') AND pnl > 0 THEN pnl ELSE 0 END) AS gross_win,
+                      SUM(CASE WHEN LOWER(side) IN ('sell','sld','dry_sld') AND pnl < 0 THEN pnl ELSE 0 END) AS gross_loss,
+                      MAX(timestamp) AS last_trade
+               FROM trades WHERE email = ? GROUP BY strategy_id""",
+            (email,)).fetchall()
+        return {r["strategy_id"]: dict(r) for r in rows}
+    finally:
+        conn.close()
+
+
+def get_closed_trade_series(email: str) -> list[tuple]:
+    """(timestamp, pnl) of closed trades ascending — minimal columns for
+    equity-curve / drawdown computation."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT timestamp, pnl FROM trades
+               WHERE email = ? AND LOWER(side) IN ('sell','sld','dry_sld')
+               ORDER BY timestamp ASC""",
+            (email,)).fetchall()
+        return [(r[0], r[1]) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_net_positions(email: str) -> list[dict]:
+    """Net open position per (strategy, symbol) derived from logged fills —
+    realtime source for grid bots, which keep position state in memory only."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT strategy_id, symbol,
+                      SUM(CASE WHEN LOWER(side) IN ('buy','bot','dry_buy','dry_bot') THEN qty ELSE -qty END) AS net_qty,
+                      SUM(CASE WHEN LOWER(side) IN ('buy','bot','dry_buy','dry_bot') THEN qty * price ELSE 0 END) AS buy_cost,
+                      SUM(CASE WHEN LOWER(side) IN ('buy','bot','dry_buy','dry_bot') THEN qty ELSE 0 END) AS buy_qty
+               FROM trades WHERE email = ?
+               GROUP BY strategy_id, symbol
+               HAVING ABS(net_qty) > 0.000001""",
+            (email,)).fetchall()
+        out = []
+        for r in rows:
+            avg_buy = (r["buy_cost"] / r["buy_qty"]) if r["buy_qty"] else 0.0
+            out.append({"strategy_id": r["strategy_id"], "symbol": r["symbol"],
+                        "position": r["net_qty"], "entry_price": round(avg_buy, 4),
+                        "side": "long" if r["net_qty"] > 0 else "short"})
+        return out
     finally:
         conn.close()
 
@@ -636,6 +736,83 @@ def get_broker_credentials(account_id: int) -> dict | None:
             d["app_secret"] = decrypt(d["app_secret_enc"])
             d["access_token"] = decrypt(d["access_token_enc"])
         return d
+    finally:
+        conn.close()
+
+
+def get_lp_creds_for_student(email: str) -> dict:
+    """Return decrypted LongPort credentials for deploy, preferring broker_accounts over students.
+
+    Falls back through: broker_accounts (paper) → broker_accounts (live) → students table.
+    Returns dict with app_key, app_secret, access_token (may be empty strings if none found).
+    """
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM broker_accounts WHERE email=? AND broker='longport' ORDER BY account_type",
+            (email,)).fetchall()
+        for row in rows:
+            ak = decrypt(row["app_key_enc"]) if row["app_key_enc"] else ""
+            as_ = decrypt(row["app_secret_enc"]) if row["app_secret_enc"] else ""
+            at = decrypt(row["access_token_enc"]) if row["access_token_enc"] else ""
+            if ak and as_ and at:
+                return {"app_key": ak, "app_secret": as_, "access_token": at}
+    finally:
+        conn.close()
+    return {"app_key": "", "app_secret": "", "access_token": ""}
+
+
+# ── Risk limits (circuit breaker) ───────────────────────────────────────────
+
+_RISK_DEFAULTS = {"daily_loss_pct": 5.0, "max_dd_pct": 10.0, "enabled": 1,
+                  "tripped": 0, "tripped_at": "", "tripped_reason": ""}
+
+
+def get_risk_limits(email: str) -> dict:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM risk_limits WHERE email = ?", (email,)).fetchone()
+        if not row:
+            return dict(_RISK_DEFAULTS, email=email)
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def save_risk_limits(email: str, daily_loss_pct: float = None,
+                     max_dd_pct: float = None, enabled: bool = None):
+    cur = get_risk_limits(email)
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO risk_limits (email, daily_loss_pct, max_dd_pct, enabled)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(email) DO UPDATE SET
+                 daily_loss_pct=excluded.daily_loss_pct,
+                 max_dd_pct=excluded.max_dd_pct,
+                 enabled=excluded.enabled""",
+            (email,
+             cur["daily_loss_pct"] if daily_loss_pct is None else float(daily_loss_pct),
+             cur["max_dd_pct"] if max_dd_pct is None else float(max_dd_pct),
+             cur["enabled"] if enabled is None else (1 if enabled else 0)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_risk_tripped(email: str, tripped: bool, reason: str = ""):
+    save_risk_limits(email)  # ensure row exists
+    conn = get_db()
+    try:
+        if tripped:
+            conn.execute(
+                "UPDATE risk_limits SET tripped=1, tripped_at=?, tripped_reason=? WHERE email=?",
+                (datetime.now(timezone.utc).isoformat(), reason, email))
+        else:
+            conn.execute(
+                "UPDATE risk_limits SET tripped=0, tripped_at='', tripped_reason='' WHERE email=?",
+                (email,))
+        conn.commit()
     finally:
         conn.close()
 

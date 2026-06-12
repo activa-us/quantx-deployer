@@ -11,7 +11,7 @@ import random
 import logging as _logging
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 from pathlib import Path
 from collections import defaultdict
@@ -37,6 +37,8 @@ from api.database import (
     get_latest_process, log_trade, get_trades, decrypt,
     get_broker_accounts, get_broker_account, save_broker_account,
     update_broker_account_status, delete_broker_account, get_broker_credentials,
+    get_lp_creds_for_student, get_risk_limits, save_risk_limits, set_risk_tripped,
+    get_trade_aggregates, get_closed_trade_series, get_net_positions,
 )
 # Dual-mode init: PostgreSQL when DATABASE_URL is set, SQLite otherwise.
 from api.database import init_db
@@ -452,7 +454,10 @@ async def lifespan(app: FastAPI):
     if HOSTING == "railway":
         threading.Thread(target=_orchestrator_loop, daemon=True, name="orchestrator").start()
         _log.info("[ORCH] Orchestrator thread started (Railway mode)")
+    watchdog_task = asyncio.create_task(_risk_watchdog())
+    _log.info("[RISK] Circuit-breaker watchdog started (60s cadence)")
     yield  # Always yield — required by FastAPI lifespan context manager
+    watchdog_task.cancel()
     # Server is exiting: ask every bot to stop cleanly (save state, close
     # grids) via its stop flag; only escalate to a hard kill on timeout.
     for email, proc in _running_processes.items():
@@ -2450,6 +2455,25 @@ async def deploy(req: DeployReq):
         finally:
             conn_active.close()
 
+    # Per-bot mode independence: an explicit Dry/Live choice is persisted to the
+    # targeted strategy only (or to all active strategies for a global deploy).
+    # Each strategy then runs in its own stored mode inside one master process.
+    req_dry_run = getattr(req, "dry_run", None)
+    if req_dry_run is not None:
+        conn_mode = get_db()
+        try:
+            if req.strategy_id:
+                conn_mode.execute(
+                    "UPDATE strategies SET is_dry_run = ? WHERE email = ? AND strategy_id = ?",
+                    ("1" if req_dry_run else "0", email, req.strategy_id))
+            else:
+                conn_mode.execute(
+                    "UPDATE strategies SET is_dry_run = ? WHERE email = ? AND is_active = 1",
+                    ("1" if req_dry_run else "0", email))
+            conn_mode.commit()
+        finally:
+            conn_mode.close()
+
     strategies = get_strategies(email, active_only=True)
     if not strategies:
         raise HTTPException(400, "No active strategies to deploy")
@@ -2465,15 +2489,14 @@ async def deploy(req: DeployReq):
     # All strategies are LongPort
     lp_strats = list(strategies)
 
-    req_dry_run = getattr(req, "dry_run", None)
-    if req_dry_run is True:
-        dry_run = True
-    elif req_dry_run is False:
-        dry_run = False
-    else:
-        dry_run = any(s.get("is_dry_run") for s in lp_strats)
+    # Modes were already persisted per strategy above — read them back
+    any_live = any(not s.get("is_dry_run") for s in lp_strats)
+    all_dry = not any_live
 
-    if not dry_run and not all(student.get(k, "") for k in ("app_key", "app_secret", "access_token")):
+    _pre_ba = get_lp_creds_for_student(email)
+    _has_creds = all(_pre_ba.get(k) for k in ("app_key", "app_secret", "access_token")) or \
+                 all(student.get(k, "") for k in ("app_key", "app_secret", "access_token"))
+    if any_live and not _has_creds:
         raise HTTPException(
             400,
             "Live deploy requires LongPort credentials. Add credentials under Brokers, or use Deploy (Dry).",
@@ -2490,9 +2513,9 @@ async def deploy(req: DeployReq):
     conn_clear.commit()
     conn_clear.close()
 
-    # Dry-run and missing-credential deploys cannot cancel live broker orders.
+    # All-dry and missing-credential deploys cannot cancel live broker orders.
     old_cancelled = 0
-    if not dry_run and all(student.get(k, "") for k in ("app_key", "app_secret", "access_token")):
+    if any_live and all(student.get(k, "") for k in ("app_key", "app_secret", "access_token")):
         old_cancelled = _cancel_student_orders(student)
 
     # Check for simple/quick_test strategies — deploy as individual simple bots
@@ -2505,7 +2528,8 @@ async def deploy(req: DeployReq):
         if is_quick:
             sym = s.get("symbol", "700.HK")
             try:
-                sp, lp = generate_simple_lp_bot(email, sym, student, dry_run=dry_run)
+                sp, lp = generate_simple_lp_bot(
+                    email, sym, student, dry_run=bool(s.get("is_dry_run", all_dry)))
                 proc = _launch_bot(sp, lp)
                 save_process(email, proc.pid, "running", sp, lp)
                 deployed_simple.append({"strategy_id": s["strategy_id"], "pid": proc.pid, "broker": "longport"})
@@ -2522,15 +2546,16 @@ async def deploy(req: DeployReq):
             "strategies_count": 0,
             "active_strategy_ids": [s.get("strategy_id", "") for s in strategies],
             "central_api_url": central_url,
-            "dry_run": dry_run,
+            "dry_run": all_dry,
         }
 
     # Generate LP master bot (shared connections for ALL LP strategies)
-    # get_student() already returns decrypted credentials
+    # Prefer credentials from broker_accounts (new system) over the legacy students table.
+    _ba_creds = get_lp_creds_for_student(email)
     lp_creds = {
-        "app_key": student.get("app_key", ""),
-        "app_secret": student.get("app_secret", ""),
-        "access_token": student.get("access_token", ""),
+        "app_key": _ba_creds["app_key"] or student.get("app_key", ""),
+        "app_secret": _ba_creds["app_secret"] or student.get("app_secret", ""),
+        "access_token": _ba_creds["access_token"] or student.get("access_token", ""),
         "central_api_url": central_url,
     }
 
@@ -2539,22 +2564,11 @@ async def deploy(req: DeployReq):
     for pos in read_open_positions(email):
         existing_states[pos["strategy_id"]] = pos
 
-    # dry_run precedence:
-    # 1. Explicit req.dry_run=True → always dry run
-    # 2. Explicit req.dry_run=False (user chose Live) → respect it, don't override
-    # 3. req.dry_run not set → fall back to strategy flags (any is_dry_run → dry)
-    req_dry_run = getattr(req, "dry_run", None)
-    if req_dry_run is True:
-        dry_run = True
-    elif req_dry_run is False:
-        # User explicitly chose Live — respect it even if some strategies have is_dry_run=True
-        dry_run = False
-    else:
-        # Not specified — use strategy-level flags
-        dry_run = any(s.get("is_dry_run") for s in lp_strats)
+    # Each strategy runs in its own stored mode (is_dry_run, persisted above);
+    # the script-level flag only means "all dry" and gates the trade connection.
     try:
         script_path, log_path = generate_lp_master_bot(
-            email, lp_strats, lp_creds, dry_run=dry_run)
+            email, lp_strats, lp_creds, dry_run=all_dry)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -2567,8 +2581,9 @@ async def deploy(req: DeployReq):
         proc = _launch_bot(script_path, log_path)
         _running_processes[email] = proc
         save_process(email, proc.pid, "running", script_path, log_path)
-        _log.info("[DEPLOY] LP master PID: %s (%d strategies, 2 connections, dry_run=%s)",
-                  proc.pid, len(lp_strats), dry_run)
+        n_live = sum(1 for s in lp_strats if not s.get("is_dry_run"))
+        _log.info("[DEPLOY] LP master PID: %s (%d strategies: %d live / %d dry)",
+                  proc.pid, len(lp_strats), n_live, len(lp_strats) - n_live)
 
         # Wait briefly to catch immediate crashes without blocking the API loop.
         await asyncio.sleep(3)
@@ -2603,7 +2618,9 @@ async def deploy(req: DeployReq):
             "lp_connections": 2,
             "central_api_url": central_url,
             "old_orders_cancelled": old_cancelled,
-            "dry_run": dry_run,
+            "dry_run": all_dry,
+            "live_count": n_live,
+            "dry_count": len(lp_strats) - n_live,
         }
     except Exception as e:
         raise HTTPException(500, f"Failed to launch bot: {e}")
@@ -3091,10 +3108,10 @@ async def status(email: str):
         s.get("strategy_id", "") for s in strategies
         if s.get("is_active")
     ]
-    trades = get_trades(email)
-    strat_pnl = defaultdict(float)
-    for t in trades:
-        strat_pnl[t["strategy_id"]] += t["pnl"]
+    # SQL aggregates — never load the full trades table on a status poll
+    aggs = get_trade_aggregates(email)
+    strat_pnl = {sid: (a["pnl"] or 0) for sid, a in aggs.items()}
+    total_trade_count = sum(a["trades"] for a in aggs.values())
 
     # Detect dry_run by reading the running bot script
     dry_run_active = False
@@ -3125,8 +3142,348 @@ async def status(email: str):
             for s in strategies
         ],
         "total_pnl": round(sum(strat_pnl.values()), 4),
-        "total_trades": len(trades),
+        "total_trades": total_trade_count,
     }
+
+
+# ── Dashboard ────────────────────────────────────────────────────────────────
+
+_SGT = timezone(timedelta(hours=8))
+_CLOSED_SIDES = {"sell", "sld", "dry_sld"}
+
+
+def _parse_ts(ts: str):
+    """Lenient timestamp parse — DB mixes ISO ('2026-06-11T03:12:45+00:00')
+    and sqlite datetime('now') ('2026-06-11 03:12:45') formats."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace(" ", "T", 1) if " " in ts[:11] else ts)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _portfolio_series_and_dd(series: list) -> tuple[list, float, float, int]:
+    """From SQL-ordered (timestamp, pnl) closed-trade tuples, build the
+    portfolio running-sum curve, max drawdown, and today's (SGT) P&L.
+    Returns (points, max_dd, today_pnl, today_trades)."""
+    sgt_midnight = datetime.now(_SGT).replace(hour=0, minute=0, second=0, microsecond=0)
+    # Lexicographic prefilter: both timestamp formats start 'YYYY-MM-DD', so
+    # only rows on/after the SGT-midnight UTC *date* need precise parsing.
+    today_date_prefix = sgt_midnight.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    points, cum, peak, max_dd = [], 0.0, 0.0, 0.0
+    today_pnl, today_trades = 0.0, 0
+    for ts_str, pnl in series:
+        cum += pnl or 0
+        peak = max(peak, cum)
+        max_dd = max(max_dd, peak - cum)
+        points.append({"t": ts_str, "v": round(cum, 2)})
+        if ts_str and ts_str[:10] >= today_date_prefix:
+            ts = _parse_ts(ts_str)
+            if ts and ts >= sgt_midnight:
+                today_pnl += pnl or 0
+                today_trades += 1
+    if len(points) > 300:
+        stride = len(points) // 300 + 1
+        points = points[::stride] + [points[-1]]
+    return points, round(max_dd, 2), round(today_pnl, 2), today_trades
+
+
+def _tail_lines(path, max_bytes: int = 65536) -> list[str]:
+    """Last lines of a file by reading only the trailing bytes — these files
+    grow to tens of MB and must never be fully read on a dashboard poll."""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        chunk = f.read().decode("utf-8", errors="replace")
+    lines = chunk.splitlines()
+    # First line may be a partial record when we seeked mid-line
+    return lines[1:] if size > max_bytes else lines
+
+
+def _csv_signal_context(sid: str) -> list:
+    """Tail of a strategy's trades CSV — the only place signal/indicator_values live."""
+    try:
+        import csv as _csv
+        import io
+        from api.config import TRADES_DIR
+        path = TRADES_DIR / f"trades_{sid}_all.csv"
+        if not path.exists():
+            return []
+        with open(path, newline="", encoding="utf-8", errors="replace") as f:
+            header = f.readline().strip()
+        tail = _tail_lines(path)
+        rows = list(_csv.DictReader(io.StringIO(header + "\n" + "\n".join(tail[-50:]))))
+        return [r for r in rows if r.get("date") != "date"]
+    except Exception:
+        return []
+
+
+_dash_cache: dict[str, tuple] = {}
+
+
+@app.get("/api/dashboard/{email}")
+async def dashboard(email: str):
+    email = email.lower().strip()
+    # Short server-side cache — one rebuild per ~8s serves every poller
+    cached = _dash_cache.get(email)
+    if cached and time.time() - cached[0] < 8:
+        return cached[1]
+    status_data = await status(email)
+    strategies = status_data["strategies"]
+    name_by_sid = {s["strategy_id"]: s.get("strategy_name", "") for s in strategies}
+
+    # SQL aggregates — never load the full trades table per poll
+    aggs = get_trade_aggregates(email)
+    total_trades_count = sum(a["trades"] for a in aggs.values())
+    total_closed = sum(a["closed"] or 0 for a in aggs.values())
+    total_wins = sum(a["wins"] or 0 for a in aggs.values())
+    win_rate = round(total_wins / total_closed * 100, 1) if total_closed else None
+
+    series = get_closed_trade_series(email)  # (timestamp, pnl) ascending
+    equity_curve, max_dd, today_pnl, today_trades = _portfolio_series_and_dd(series)
+
+    # Recent trades + signal context from per-strategy CSVs
+    recent = []
+    csv_cache: dict[str, list] = {}
+    for t in get_trades(email, limit=15):
+        sid = t.get("strategy_id", "")
+        row = {
+            "timestamp": t.get("timestamp", ""), "strategy_id": sid,
+            "strategy_name": name_by_sid.get(sid, sid),
+            "symbol": t.get("symbol", ""), "side": t.get("side", ""),
+            "qty": t.get("qty", 0), "price": t.get("price", 0),
+            "pnl": t.get("pnl", 0), "signal": "", "indicator_values": "",
+        }
+        if sid not in csv_cache:
+            csv_cache[sid] = _csv_signal_context(sid)
+        t_ts = _parse_ts(t.get("timestamp", ""))
+        for c in reversed(csv_cache[sid]):
+            c_ts = _parse_ts(c.get("date", "") or c.get("bar_date", ""))
+            if (t_ts and c_ts and abs((t_ts - c_ts).total_seconds()) <= 2
+                    and str(c.get("side", "")).upper()[:3] == str(t.get("side", "")).upper()[:3]):
+                row["signal"] = c.get("signal", "")
+                row["indicator_values"] = c.get("indicator_values", "")
+                break
+        recent.append(row)
+
+    # Open positions + exposure. Signal bots persist pos_{sid}.json (authoritative,
+    # handles shorts); grid bots keep position in memory only — derive theirs from
+    # logged fills so the dashboard stays realtime.
+    positions = []
+    file_sids = set()
+    for p in read_open_positions(email):
+        p = dict(p)
+        p.pop("state_file", None)
+        p["strategy_name"] = name_by_sid.get(p["strategy_id"], p["strategy_id"])
+        file_sids.add(p["strategy_id"])
+        positions.append(p)
+    from api.config import STATE_DIR
+    for p in get_net_positions(email):
+        sid = p["strategy_id"]
+        if sid in file_sids or sid not in name_by_sid:
+            continue
+        if (STATE_DIR / f"pos_{sid}.json").exists():
+            continue  # signal bot with a flat (0) state file — trust the file
+        p["strategy_name"] = name_by_sid.get(sid, sid)
+        positions.append(p)
+    total_alloc = sum(float(s.get("allocation") or 0) for s in strategies) or 0
+    expo_by_symbol = defaultdict(float)
+    for p in positions:
+        expo_by_symbol[p["symbol"]] += abs(p["position"] * p["entry_price"])
+    exposure = [
+        {"symbol": sym, "value": round(v, 2),
+         "pct": round(v / total_alloc * 100, 1) if total_alloc else None}
+        for sym, v in sorted(expo_by_symbol.items(), key=lambda x: -x[1])]
+
+    # Per-strategy analytics + bot cards (from SQL aggregates)
+    analytics, bots = [], []
+    last_signals = _last_signals_from_log(email)
+    # Per-bot modes: each strategy runs in its stored is_dry_run mode inside the
+    # master process. The process-level dry flag means "all dry" — when it's set
+    # (including bots generated before per-bot modes existed) everything is dry.
+    proc_running = status_data["lp_running"]
+    proc_dry = status_data["dry_run"]
+    for s in strategies:
+        sid = s["strategy_id"]
+        a = aggs.get(sid)
+        alloc = float(s.get("allocation") or 0) or 10000
+        bt = s.get("backtest_results") or {}
+        bt_ret = bt.get("total_return_pct") if isinstance(bt, dict) else None
+        live_ret = round(s["total_pnl"] / alloc * 100, 2)
+        if a:
+            closed_n = a["closed"] or 0
+            wins_n = a["wins"] or 0
+            gross_w = a["gross_win"] or 0
+            gross_l = abs(a["gross_loss"] or 0)
+            losses_n = closed_n - wins_n
+            analytics.append({
+                "strategy_id": sid, "strategy_name": s.get("strategy_name", ""),
+                "win_rate": round(wins_n / closed_n * 100, 1) if closed_n else None,
+                "profit_factor": round(gross_w / gross_l, 2) if gross_l else None,
+                "avg_win": round(gross_w / wins_n, 2) if wins_n else None,
+                "avg_loss": round(-gross_l / losses_n, 2) if losses_n else None,
+                "live_return_pct": live_ret,
+                "backtest_return_pct": bt_ret,
+                "drift_pct": round(live_ret - bt_ret, 2) if bt_ret is not None else None,
+                "last_trade": a["last_trade"] or "",
+            })
+        spark = [t.get("cumulative_pnl", 0)
+                 for t in reversed(get_trades(email, strategy_id=sid, limit=20))] if a else []
+        is_active = bool(s.get("is_active"))
+        stored_dry = str(s.get("is_dry_run", "0")) in ("1", "True", "true")
+        # Stored mode is each bot's own runtime mode; an all-dry process overrides
+        effective_dry = stored_dry or (is_active and proc_running and proc_dry)
+        bots.append({
+            "strategy_id": sid, "strategy_name": s.get("strategy_name", ""),
+            "symbol": s.get("symbol", ""), "is_active": is_active,
+            "is_dry_run": effective_dry, "running": is_active and proc_running,
+            "pnl": s["total_pnl"], "trades": a["trades"] if a else 0,
+            "last_signal": last_signals.get(sid, ""), "spark": spark,
+        })
+
+    # Health
+    import shutil as _shutil
+    from api.config import BASE_DIR
+    email_safe = email.replace("@", "_at_").replace(".", "_")
+    log_path = LOGS_DIR / f"{email_safe}_lp_master.log"
+    last_activity, log_errors = None, 0
+    if log_path.exists():
+        try:
+            last_activity = datetime.fromtimestamp(
+                log_path.stat().st_mtime, tz=timezone.utc).isoformat()
+            tail = _tail_lines(log_path)[-200:]
+            log_errors = sum(1 for ln in tail if "ERROR" in ln or "Traceback" in ln)
+        except Exception:
+            pass
+    uptime_sec = None
+    if status_data["lp_running"] and status_data.get("lp_pid"):
+        try:
+            import psutil
+            uptime_sec = int(time.time() - psutil.Process(status_data["lp_pid"]).create_time())
+        except Exception:
+            pass
+    brokers = get_broker_accounts(email)
+    risk = get_risk_limits(email)
+
+    active = [s for s in strategies if s.get("is_active")] if status_data["lp_running"] else []
+    dry_active = [s for s in active if str(s.get("is_dry_run", "0")) in ("1", "True", "true")]
+    # When the whole process runs dry (script-level DRY_RUN), count all as dry
+    if status_data["dry_run"]:
+        dry_active = active
+
+    result = {
+        "stats": {
+            "total_pnl": status_data["total_pnl"], "today_pnl": today_pnl,
+            "total_trades": total_trades_count, "today_trades": today_trades,
+            "win_rate": win_rate, "max_drawdown": max_dd,
+            "active_bots": len(active), "live_bots": len(active) - len(dry_active),
+            "dry_bots": len(dry_active), "total_strategies": len(strategies),
+            "connected_brokers": sum(1 for b in brokers if b.get("is_connected")),
+        },
+        "equity_curve": equity_curve,
+        "open_positions": positions,
+        "exposure": exposure,
+        "recent_trades": recent,
+        "bots": bots,
+        "analytics": analytics,
+        "health": {
+            "version": VERSION, "lp_running": status_data["lp_running"],
+            "lp_pid": status_data.get("lp_pid"), "uptime_sec": uptime_sec,
+            "dry_run": status_data["dry_run"], "last_activity": last_activity,
+            "disk_free_gb": round(_shutil.disk_usage(str(BASE_DIR)).free / 1e9, 1),
+            "log_errors": log_errors, "brokers": brokers,
+        },
+        "risk": {
+            "daily_loss_pct": risk["daily_loss_pct"], "max_dd_pct": risk["max_dd_pct"],
+            "enabled": bool(risk["enabled"]), "tripped": bool(risk["tripped"]),
+            "tripped_at": risk["tripped_at"], "tripped_reason": risk["tripped_reason"],
+        },
+    }
+    _dash_cache[email] = (time.time(), result)
+    return result
+
+
+def _last_signals_from_log(email: str) -> dict:
+    """Newest '[TRADE][sid] ...' line per strategy from the master log tail."""
+    out: dict[str, str] = {}
+    try:
+        email_safe = email.replace("@", "_at_").replace(".", "_")
+        log_path = LOGS_DIR / f"{email_safe}_lp_master.log"
+        if not log_path.exists():
+            return out
+        import re
+        for ln in reversed(_tail_lines(log_path)[-300:]):
+            m = re.search(r"\[TRADE\]\[([^\]]+)\]\s*(.+)", ln)
+            if m and m.group(1) not in out:
+                out[m.group(1)] = m.group(2).strip()[:120]
+    except Exception:
+        pass
+    return out
+
+
+# ── Risk limits / circuit breaker ────────────────────────────────────────────
+
+class RiskLimitsReq(BaseModel):
+    email: str
+    daily_loss_pct: Optional[float] = None
+    max_dd_pct: Optional[float] = None
+    enabled: Optional[bool] = None
+    reset: bool = False
+
+
+@app.get("/api/risk-limits")
+async def risk_limits_get(email: str = Query("")):
+    return get_risk_limits(email.lower().strip())
+
+
+@app.post("/api/risk-limits")
+async def risk_limits_post(req: RiskLimitsReq):
+    email = req.email.lower().strip()
+    save_risk_limits(email, daily_loss_pct=req.daily_loss_pct,
+                     max_dd_pct=req.max_dd_pct, enabled=req.enabled)
+    if req.reset:
+        set_risk_tripped(email, False)
+    return get_risk_limits(email)
+
+
+async def _risk_watchdog():
+    """Circuit breaker: stop all bots when daily loss or trailing drawdown
+    exceeds the configured limits (defaults: 5% daily / 10% max DD)."""
+    while True:
+        try:
+            for email, proc in list(_running_processes.items()):
+                if proc.poll() is not None:
+                    continue
+                risk = get_risk_limits(email)
+                if not risk["enabled"] or risk["tripped"]:
+                    continue
+                strategies = get_strategies(email)
+                total_alloc = sum(float(s.get("allocation") or 0) or 10000 for s in strategies)
+                if total_alloc <= 0:
+                    continue
+                # 2-col query off the event loop — table can be 100k+ rows
+                series = await asyncio.to_thread(get_closed_trade_series, email)
+                _, max_dd, today_pnl, _n = _portfolio_series_and_dd(series)
+                reason = ""
+                if today_pnl <= -(risk["daily_loss_pct"] / 100) * total_alloc:
+                    reason = (f"Daily loss ${-today_pnl:,.2f} breached "
+                              f"{risk['daily_loss_pct']}% of ${total_alloc:,.0f}")
+                elif max_dd >= (risk["max_dd_pct"] / 100) * total_alloc:
+                    reason = (f"Drawdown ${max_dd:,.2f} breached "
+                              f"{risk['max_dd_pct']}% of ${total_alloc:,.0f}")
+                if reason:
+                    _log.warning("[RISK] Circuit breaker TRIPPED for %s: %s", email, reason)
+                    set_risk_tripped(email, True, reason)
+                    try:
+                        _stop_process(email)
+                    except Exception as e:
+                        _log.error("[RISK] stop failed for %s: %s", email, e)
+        except Exception as e:
+            _log.error("[RISK] watchdog error: %s", e)
+        await asyncio.sleep(60)
 
 
 @app.get("/api/logs/{email}/{strategy_id}")
@@ -3367,9 +3724,10 @@ async def clear_bot_scripts(request: Request):
 
 
 @app.get("/api/trades/{email}")
-async def trades_list(email: str):
+async def trades_list(email: str, strategy_id: str = Query(""),
+                      limit: int = Query(0, ge=0, le=100000)):
     email = email.lower().strip()
-    trades = get_trades(email)
+    trades = get_trades(email, strategy_id=strategy_id or None, limit=limit or None)
     # Group by strategy_id
     by_strategy = defaultdict(list)
     for t in trades:

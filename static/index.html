@@ -396,7 +396,32 @@ label { display:block; font-size:12px; font-weight:600; color:var(--text-seconda
 
 <!-- ══════════════════════════════════════ HOME ══════════════════════════════════════ -->
 <div class="page active" id="page-home">
-  <div class="page-header"><h1 class="page-title" id="home-title">Welcome back</h1></div>
+  <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+    <h1 class="page-title" id="home-title">Welcome back</h1>
+    <div style="display:flex;align-items:center;gap:10px">
+      <span id="dash-risk-chip" onclick="toggleRiskForm()" style="display:none;cursor:pointer;font-size:11px;padding:4px 10px;border:1px solid var(--border);border-radius:999px;color:var(--text-secondary)" title="Click to edit circuit-breaker limits"></span>
+      <button id="dash-killswitch" onclick="stopAllBots()" style="display:none;background:var(--red);color:#fff;border:none;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit">⛔ Stop All Bots</button>
+    </div>
+  </div>
+  <!-- Circuit breaker tripped banner -->
+  <div id="dash-cb-banner" style="display:none;background:var(--red);color:#fff;padding:12px 16px;border-radius:8px;margin-bottom:16px;align-items:center;justify-content:space-between;gap:12px">
+    <div>
+      <strong>⛔ CIRCUIT BREAKER TRIPPED</strong>
+      <span id="dash-cb-reason" style="margin-left:8px;font-size:13px"></span>
+      <span id="dash-cb-time" style="margin-left:8px;font-size:11px;opacity:.8"></span>
+    </div>
+    <button onclick="resetBreaker()" style="background:#fff;color:var(--red);border:none;padding:6px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap">Reset breaker</button>
+  </div>
+  <!-- Risk limits inline editor -->
+  <div id="dash-risk-form" class="card" style="display:none;margin-bottom:16px;max-width:520px">
+    <h3 style="margin-bottom:10px;font-size:14px">Circuit Breaker Limits</h3>
+    <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+      <div class="form-group" style="margin:0"><label>Daily loss limit %</label><input type="number" id="risk-daily" step="0.5" min="0.1" style="width:110px"></div>
+      <div class="form-group" style="margin:0"><label>Max drawdown %</label><input type="number" id="risk-dd" step="0.5" min="0.1" style="width:110px"></div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;padding-bottom:8px"><input type="checkbox" id="risk-enabled"> Enabled</label>
+      <button class="btn btn-primary btn-sm" onclick="saveRiskLimits()">Save</button>
+    </div>
+  </div>
   <!-- Inline login form (only if not logged in) -->
   <!-- Local-mode quick-login (single-user, no password) -->
   <div id="home-login-form" class="card" style="display:none;margin-bottom:24px;max-width:500px">
@@ -429,10 +454,38 @@ label { display:block; font-size:12px; font-weight:600; color:var(--text-seconda
       connected brokers execute on your account.
     </div>
   </div>
-  <div class="stat-row" style="grid-template-columns:repeat(3,1fr)">
-    <div class="stat-card"><div class="stat-label">Active Bots</div><div class="stat-value" id="home-active">0</div></div>
-    <div class="stat-card"><div class="stat-label">Connected Brokers</div><div class="stat-value" id="home-brokers">0</div></div>
-    <div class="stat-card"><div class="stat-label">Total Strategies</div><div class="stat-value" id="home-strategies">0</div></div>
+  <div id="dash-grid" style="display:none">
+    <!-- Row 1: stat cards -->
+    <div class="stat-row" style="grid-template-columns:repeat(6,1fr)">
+      <div class="stat-card"><div class="stat-label">Total P&amp;L</div><div class="stat-value" id="dash-total-pnl">—</div></div>
+      <div class="stat-card"><div class="stat-label">Today's P&amp;L</div><div class="stat-value" id="dash-today-pnl">—</div>
+        <div style="font-size:11px;color:var(--text-muted)" id="dash-today-trades"></div></div>
+      <div class="stat-card"><div class="stat-label">Total Trades</div><div class="stat-value" id="dash-trades">0</div></div>
+      <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value" id="dash-winrate">—</div>
+        <div style="font-size:11px;color:var(--text-muted)" id="dash-maxdd"></div></div>
+      <div class="stat-card"><div class="stat-label">Active Bots</div><div class="stat-value" id="dash-active">0</div>
+        <div style="font-size:11px;color:var(--text-muted)" id="dash-active-split"></div></div>
+      <div class="stat-card"><div class="stat-label">Brokers</div><div class="stat-value" id="dash-brokers">0</div></div>
+    </div>
+    <!-- Row 2: equity curve + system health -->
+    <div style="display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:20px">
+      <div class="card" style="margin-bottom:0"><h3 style="margin-bottom:12px;font-size:15px">Portfolio Equity Curve</h3>
+        <div style="height:240px;position:relative"><canvas id="dash-equity"></canvas></div></div>
+      <div class="card" style="margin-bottom:0"><h3 style="margin-bottom:12px;font-size:15px">System Health</h3>
+        <div id="dash-health-body" style="font-size:13px"></div></div>
+    </div>
+    <!-- Row 3: open positions + recent trades -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
+      <div class="card" style="margin-bottom:0"><h3 style="margin-bottom:12px;font-size:15px">Open Positions</h3>
+        <div id="dash-positions"></div></div>
+      <div class="card" style="margin-bottom:0"><h3 style="margin-bottom:12px;font-size:15px">Recent Trades</h3>
+        <div id="dash-recent" style="max-height:320px;overflow-y:auto"></div></div>
+    </div>
+    <!-- Row 4: strategy analytics -->
+    <div class="card" style="margin-bottom:20px"><h3 style="margin-bottom:12px;font-size:15px">Strategy Performance</h3>
+      <div id="dash-analytics" style="overflow-x:auto"></div></div>
+    <!-- Row 5: bot cards -->
+    <div id="dash-bots" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-bottom:20px"></div>
   </div>
   <div class="card" style="margin-bottom:20px">
     <h3 style="margin-bottom:12px;font-size:15px">Quick Actions</h3>
@@ -2573,25 +2626,311 @@ async function loadHome() {
   const webForm = document.getElementById('web-auth-form');
   if (webForm) webForm.style.display = 'none';
   document.getElementById('home-login-form').style.display = 'none';
-  document.getElementById('home-brokers').textContent = BROKER_ACCOUNTS.length || '0';
-  if (EMAIL && !BROKER_ACCOUNTS.length) {
-    fetch(API + '/api/broker-accounts?email=' + encodeURIComponent(EMAIL))
-      .then(r => r.json()).then(d => {
-        BROKER_ACCOUNTS = d.accounts || [];
-        document.getElementById('home-brokers').textContent = BROKER_ACCOUNTS.length;
-      }).catch(() => {});
-  }
   try {
-    const r = await fetch(API + '/api/strategies/' + encodeURIComponent(EMAIL));
-    const d = await r.json();
-    USER_STRATEGIES = Array.isArray(d) ? d : (d.strategies || []);
-    const active = USER_STRATEGIES.filter(s => s.is_active).length;
-    document.getElementById('home-active').textContent = active;
-    document.getElementById('home-strategies').textContent = USER_STRATEGIES.length;
-    document.getElementById('home-getstarted').style.display = USER_STRATEGIES.length === 0 ? 'block' : 'none';
+    const r = await fetch(API + '/api/dashboard/' + encodeURIComponent(EMAIL));
+    renderDashboard(await r.json());
   } catch (e) {}
   // First-launch onboarding: no cache + haven't dismissed
   checkFirstLaunch();
+}
+
+/* ═══════════════════ DASHBOARD ═══════════════════ */
+
+let _dashData = null;
+
+function _money(v) { return (v < 0 ? '-$' : '$') + Math.abs(v || 0).toFixed(2); }
+function _pnlColor(el, v) { el.style.color = v > 0 ? 'var(--green)' : (v < 0 ? 'var(--red)' : 'var(--text-primary)'); }
+function _ago(iso) {
+  if (!iso) return '—';
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return Math.round(s) + 's ago';
+  if (s < 3600) return Math.round(s / 60) + 'm ago';
+  if (s < 86400) return Math.round(s / 3600) + 'h ago';
+  return Math.round(s / 86400) + 'd ago';
+}
+function _fmtTime(ts) {
+  const d = new Date(ts);
+  return d.toLocaleDateString('en-SG', {month:'short',day:'numeric'}) + ' ' +
+         d.toLocaleTimeString('en-SG', {hour:'2-digit',minute:'2-digit'});
+}
+function _dryBadge(isDry) {
+  return isDry
+    ? '<span class="badge" style="background:#FEF3C7;color:#92400E">DRY</span>'
+    : '<span class="badge" style="background:var(--green-light);color:var(--green)">LIVE</span>';
+}
+
+function renderDashboard(d) {
+  if (!d || !d.stats) return;
+  _dashData = d;
+  const empty = d.stats.total_strategies === 0;
+  document.getElementById('home-getstarted').style.display = empty ? 'block' : 'none';
+  document.getElementById('dash-grid').style.display = empty ? 'none' : '';
+  if (empty) return;
+
+  // Header controls
+  document.getElementById('dash-killswitch').style.display = d.health.lp_running ? '' : 'none';
+  const chip = document.getElementById('dash-risk-chip');
+  chip.style.display = '';
+  chip.textContent = (d.risk.enabled ? '🛡 ' : '🛡 (off) ') +
+    'Daily −' + d.risk.daily_loss_pct + '% / DD ' + d.risk.max_dd_pct + '%';
+  const banner = document.getElementById('dash-cb-banner');
+  banner.style.display = d.risk.tripped ? 'flex' : 'none';
+  if (d.risk.tripped) {
+    document.getElementById('dash-cb-reason').textContent = d.risk.tripped_reason || '';
+    document.getElementById('dash-cb-time').textContent = d.risk.tripped_at ? _ago(d.risk.tripped_at) : '';
+  }
+
+  // Stat cards
+  const tp = document.getElementById('dash-total-pnl');
+  tp.textContent = _money(d.stats.total_pnl); _pnlColor(tp, d.stats.total_pnl);
+  const dp = document.getElementById('dash-today-pnl');
+  dp.textContent = _money(d.stats.today_pnl); _pnlColor(dp, d.stats.today_pnl);
+  document.getElementById('dash-today-trades').textContent = d.stats.today_trades + ' trades today';
+  document.getElementById('dash-trades').textContent = d.stats.total_trades;
+  document.getElementById('dash-winrate').textContent = d.stats.win_rate == null ? '—' : d.stats.win_rate.toFixed(0) + '%';
+  document.getElementById('dash-maxdd').textContent = 'Max DD ' + _money(d.stats.max_drawdown);
+  document.getElementById('dash-active').textContent = d.stats.active_bots;
+  document.getElementById('dash-active-split').textContent =
+    d.stats.active_bots ? d.stats.live_bots + ' live · ' + d.stats.dry_bots + ' dry' : '';
+  document.getElementById('dash-brokers').textContent = d.stats.connected_brokers;
+
+  _renderDashEquity(d.equity_curve || []);
+  _renderDashHealth(d.health);
+  _renderDashPositions(d.open_positions || [], d.exposure || []);
+  _renderDashRecent(d.recent_trades || []);
+  _renderDashAnalytics(d.analytics || []);
+  _renderDashBots(d.bots || []);
+}
+
+function _renderDashEquity(points) {
+  const canvas = document.getElementById('dash-equity');
+  if (!canvas) return;
+  if (!points.length) {
+    if (window._dashChartInstance) { window._dashChartInstance.destroy(); window._dashChartInstance = null; }
+    return;
+  }
+  const labels = points.map(p => p.t ? _fmtTime(p.t) : '');
+  const data = points.map(p => p.v);
+  const lineColor = data[data.length-1] >= 0 ? '#16A34A' : '#DC2626';
+  const fillColor = data[data.length-1] >= 0 ? 'rgba(22,163,74,0.08)' : 'rgba(220,38,38,0.08)';
+  if (window._dashChartInstance) {
+    // Mutate in place — avoids flicker on the 10s poll
+    const c = window._dashChartInstance;
+    c.data.labels = labels;
+    c.data.datasets[0].data = data;
+    c.data.datasets[0].borderColor = lineColor;
+    c.data.datasets[0].backgroundColor = fillColor;
+    c.update('none');
+    return;
+  }
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  window._dashChartInstance = new Chart(canvas, {
+    type: 'line',
+    data: { labels, datasets: [{ data, borderColor: lineColor, backgroundColor: fillColor,
+      fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false },
+        tooltip: { callbacks: { label: ctx => ' $' + ctx.parsed.y.toFixed(2) } } },
+      scales: {
+        x: { display: true, ticks: { maxTicksLimit: 6, font: { size: 10 } } },
+        y: { ticks: { callback: v => '$' + v, font: { size: 10 } },
+             grid: { color: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)' } }
+      }
+    }
+  });
+}
+
+function _renderDashHealth(h) {
+  const dot = ok => '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' +
+    (ok ? 'var(--green)' : 'var(--red)') + ';margin-right:6px"></span>';
+  const row = (label, val) => '<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)">' +
+    '<span style="color:var(--text-secondary)">' + label + '</span><span>' + val + '</span></div>';
+  let html = '';
+  html += row('Bot process', dot(h.lp_running) + (h.lp_running ? 'Running' +
+    (h.lp_pid ? ' (pid ' + h.lp_pid + ')' : '') + (h.dry_run ? ' · DRY' : '') : 'Stopped'));
+  if (h.uptime_sec != null) {
+    const hrs = Math.floor(h.uptime_sec / 3600), mins = Math.floor((h.uptime_sec % 3600) / 60);
+    html += row('Uptime', (hrs ? hrs + 'h ' : '') + mins + 'm');
+  }
+  html += row('Last activity', _ago(h.last_activity));
+  const diskWarn = h.disk_free_gb < 5;
+  html += row('Disk free', '<span style="color:' + (diskWarn ? 'var(--red)' : 'inherit') +
+    ';font-weight:' + (diskWarn ? '700' : '400') + '">' + h.disk_free_gb + ' GB' + (diskWarn ? ' ⚠' : '') + '</span>');
+  html += row('Log errors (recent)', '<span style="color:' + (h.log_errors ? 'var(--red)' : 'inherit') + '">' +
+    h.log_errors + '</span>');
+  (h.brokers || []).forEach(b => {
+    html += row(esc((b.nickname || b.broker) + ' (' + b.account_type + ')'),
+      dot(b.is_connected) + (b.is_connected ? 'Connected' : 'Disconnected'));
+  });
+  html += row('Version', 'v' + esc(h.version || ''));
+  document.getElementById('dash-health-body').innerHTML = html;
+}
+
+function _renderDashPositions(positions, exposure) {
+  const el = document.getElementById('dash-positions');
+  if (!positions.length) {
+    el.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:12px 0">No open positions</div>';
+    return;
+  }
+  let html = '<table style="width:100%;font-size:12px;border-collapse:collapse">' +
+    '<tr style="color:var(--text-secondary);text-align:left"><th style="padding:4px">Symbol</th><th>Side</th><th style="text-align:right">Qty</th><th style="text-align:right">Entry</th><th>Strategy</th></tr>';
+  positions.forEach(p => {
+    html += '<tr style="border-top:1px solid var(--border)"><td style="padding:6px 4px;font-weight:600">' + esc(p.symbol) + '</td>' +
+      '<td style="color:' + (p.side === 'long' ? 'var(--green)' : 'var(--red)') + '">' + p.side.toUpperCase() + '</td>' +
+      '<td style="text-align:right">' + Math.abs(p.position) + '</td>' +
+      '<td style="text-align:right">$' + (p.entry_price || 0).toFixed(2) + '</td>' +
+      '<td style="color:var(--text-muted)">' + esc(p.strategy_name || p.strategy_id) + '</td></tr>';
+  });
+  html += '</table>';
+  if (exposure.length) {
+    html += '<div style="margin-top:10px;font-size:11px;color:var(--text-secondary)">Exposure: ' +
+      exposure.map(e => esc(e.symbol) + ' ' + _money(e.value) + (e.pct != null ? ' (' + e.pct + '%)' : '')).join(' · ') + '</div>';
+  }
+  el.innerHTML = html;
+}
+
+function _renderDashRecent(trades) {
+  const el = document.getElementById('dash-recent');
+  if (!trades.length) {
+    el.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:12px 0">No trades yet</div>';
+    return;
+  }
+  let html = '<div style="display:flex;justify-content:space-between;gap:8px;font-size:11px;color:var(--text-secondary);font-weight:600;padding:0 0 6px;border-bottom:1px solid var(--border)">' +
+    '<span style="min-width:90px">Execution Time</span>' +
+    '<span style="min-width:36px">Side</span>' +
+    '<span style="min-width:62px">Symbol</span>' +
+    '<span>Qty @ Price</span>' +
+    '<span style="min-width:70px;text-align:right">P&amp;L</span></div>';
+  trades.forEach(t => {
+    const isBuy = (t.side || '').toLowerCase().includes('b');
+    const pnlHtml = (t.pnl || 0) !== 0
+      ? '<span style="color:' + (t.pnl > 0 ? 'var(--green)' : 'var(--red)') + ';font-weight:600">' + _money(t.pnl) + '</span>' : '';
+    const detail = (t.signal || t.indicator_values)
+      ? '<div style="font-size:11px;color:var(--text-muted);padding:4px 8px 6px 22px">' +
+        (t.signal ? 'signal: <b>' + esc(t.signal) + '</b>' : '') +
+        (t.indicator_values ? '<br>' + esc(t.indicator_values) : '') + '</div>' : '';
+    const rowInner = '<div style="display:flex;justify-content:space-between;gap:8px;font-size:12px;padding:6px 0">' +
+      '<span style="color:var(--text-muted);white-space:nowrap;min-width:90px">' + _fmtTime(t.timestamp) + '</span>' +
+      '<span style="color:' + (isBuy ? 'var(--green)' : 'var(--red)') + ';font-weight:600;min-width:36px">' + esc((t.side || '').toUpperCase().replace('BOT','BUY').replace('SLD','SELL')) + '</span>' +
+      '<span style="font-weight:600;min-width:62px">' + esc(t.symbol) + '</span>' +
+      '<span>' + t.qty + ' @ $' + (t.price || 0).toFixed(2) + '</span>' +
+      '<span style="min-width:70px;text-align:right">' + pnlHtml + '</span></div>';
+    html += detail
+      ? '<details style="border-bottom:1px solid var(--border)"><summary style="cursor:pointer;list-style-position:inside">' + rowInner + '</summary>' + detail + '</details>'
+      : '<div style="border-bottom:1px solid var(--border)">' + rowInner + '</div>';
+  });
+  el.innerHTML = html;
+}
+
+function _renderDashAnalytics(rows) {
+  const el = document.getElementById('dash-analytics');
+  if (!rows.length) {
+    el.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:12px 0">No traded strategies yet</div>';
+    return;
+  }
+  const num = (v, suffix, fix) => v == null ? '—' : v.toFixed(fix == null ? 2 : fix) + (suffix || '');
+  let html = '<table style="width:100%;font-size:12px;border-collapse:collapse">' +
+    '<tr style="color:var(--text-secondary);text-align:left"><th style="padding:4px">Strategy</th>' +
+    '<th style="text-align:right">Win rate</th><th style="text-align:right">Profit factor</th>' +
+    '<th style="text-align:right">Avg win</th><th style="text-align:right">Avg loss</th>' +
+    '<th style="text-align:right">Live %</th><th style="text-align:right">Backtest %</th>' +
+    '<th style="text-align:right">Drift</th><th style="text-align:right">Last trade</th></tr>';
+  rows.forEach(a => {
+    const driftColor = a.drift_pct == null ? 'var(--text-muted)' : (a.drift_pct >= 0 ? 'var(--green)' : 'var(--red)');
+    html += '<tr style="border-top:1px solid var(--border);cursor:pointer" onclick="openBotDetail(\'' + esc(a.strategy_id) + '\')">' +
+      '<td style="padding:6px 4px;font-weight:600">' + esc(a.strategy_name || a.strategy_id) + '</td>' +
+      '<td style="text-align:right">' + num(a.win_rate, '%', 0) + '</td>' +
+      '<td style="text-align:right">' + num(a.profit_factor) + '</td>' +
+      '<td style="text-align:right;color:var(--green)">' + (a.avg_win == null ? '—' : _money(a.avg_win)) + '</td>' +
+      '<td style="text-align:right;color:var(--red)">' + (a.avg_loss == null ? '—' : _money(a.avg_loss)) + '</td>' +
+      '<td style="text-align:right">' + num(a.live_return_pct, '%') + '</td>' +
+      '<td style="text-align:right">' + num(a.backtest_return_pct, '%') + '</td>' +
+      '<td style="text-align:right;color:' + driftColor + '">' + (a.drift_pct == null ? '—' : (a.drift_pct >= 0 ? '+' : '') + a.drift_pct.toFixed(1) + '%') + '</td>' +
+      '<td style="text-align:right;color:var(--text-muted)">' + (a.last_trade ? _ago(a.last_trade) : '—') + '</td></tr>';
+  });
+  el.innerHTML = html + '</table>';
+}
+
+function _sparkSvg(values) {
+  if (!values || values.length < 2) return '';
+  const min = Math.min(...values), max = Math.max(...values), range = (max - min) || 1;
+  const w = 80, h = 24;
+  const pts = values.map((v, i) =>
+    (i / (values.length - 1) * w).toFixed(1) + ',' + (h - (v - min) / range * h).toFixed(1)).join(' ');
+  const color = values[values.length-1] >= values[0] ? 'var(--green)' : 'var(--red)';
+  return '<svg width="' + w + '" height="' + h + '" style="vertical-align:middle"><polyline points="' + pts +
+    '" fill="none" stroke="' + color + '" stroke-width="1.5"/></svg>';
+}
+
+function _renderDashBots(bots) {
+  const el = document.getElementById('dash-bots');
+  el.innerHTML = bots.map(b => {
+    const pnlColor = b.pnl > 0 ? 'var(--green)' : (b.pnl < 0 ? 'var(--red)' : 'var(--text-primary)');
+    // Running bots show their real runtime mode (DRY/LIVE); stopped bots show
+    // a neutral OFF badge so a stopped live-configured bot never looks armed.
+    const badge = b.running ? _dryBadge(b.is_dry_run)
+      : '<span class="badge" style="background:var(--surface-2);color:var(--text-muted)">OFF</span>';
+    return '<div class="card" style="margin-bottom:0;cursor:pointer;padding:12px" onclick="openBotDetail(\'' + esc(b.strategy_id) + '\')">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px">' +
+        '<div style="font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(b.strategy_name || b.strategy_id) + '</div>' +
+        badge + '</div>' +
+      '<div style="font-size:11px;color:var(--text-muted);margin:2px 0 6px">' + esc(b.symbol) +
+        (b.running ? '' : ' · stopped') + ' · ' + b.trades + ' trades</div>' +
+      '<div style="display:flex;justify-content:space-between;align-items:center">' +
+        '<span style="font-weight:700;font-size:15px;color:' + pnlColor + '">' + _money(b.pnl) + '</span>' +
+        _sparkSvg(b.spark) + '</div>' +
+      (b.last_signal ? '<div style="font-size:10px;color:var(--text-muted);margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(b.last_signal) + '">⚡ ' + esc(b.last_signal) + '</div>' : '') +
+      '</div>';
+  }).join('');
+}
+
+/* Kill switch + risk limit controls */
+
+async function stopAllBots() {
+  if (!confirm('Stop ALL running bots? Open positions are kept (not liquidated).')) return;
+  try {
+    const r = await fetch(API + '/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: EMAIL, broker: 'all' }) });
+    if (r.ok) { showToast('Stop signal sent to all bots', 'success'); }
+    else { showToast('Stop failed: HTTP ' + r.status, 'error'); }
+  } catch (e) { showToast('Stop failed: ' + e.message, 'error'); }
+  setTimeout(loadHome, 1500);
+}
+
+function toggleRiskForm() {
+  const f = document.getElementById('dash-risk-form');
+  const show = f.style.display === 'none';
+  f.style.display = show ? '' : 'none';
+  if (show && _dashData) {
+    document.getElementById('risk-daily').value = _dashData.risk.daily_loss_pct;
+    document.getElementById('risk-dd').value = _dashData.risk.max_dd_pct;
+    document.getElementById('risk-enabled').checked = _dashData.risk.enabled;
+  }
+}
+
+async function saveRiskLimits() {
+  try {
+    const r = await fetch(API + '/api/risk-limits', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: EMAIL,
+        daily_loss_pct: parseFloat(document.getElementById('risk-daily').value) || null,
+        max_dd_pct: parseFloat(document.getElementById('risk-dd').value) || null,
+        enabled: document.getElementById('risk-enabled').checked,
+      }) });
+    if (r.ok) { showToast('Risk limits saved', 'success'); document.getElementById('dash-risk-form').style.display = 'none'; loadHome(); }
+    else { showToast('Save failed: HTTP ' + r.status, 'error'); }
+  } catch (e) { showToast('Save failed: ' + e.message, 'error'); }
+}
+
+async function resetBreaker() {
+  if (!confirm('Reset the circuit breaker? Review what tripped it before redeploying.')) return;
+  try {
+    await fetch(API + '/api/risk-limits', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: EMAIL, reset: true }) });
+    showToast('Circuit breaker reset', 'success');
+    loadHome();
+  } catch (e) { showToast('Reset failed: ' + e.message, 'error'); }
 }
 
 /* ══════════════════════════════════════════════════════
@@ -2850,20 +3189,14 @@ function filterBots(f, el) {
 function filterBotSearch(v) { _botSearch = v; renderBots(); }
 
 async function _fetchBotsPnl() {
+  // Per-strategy P&L comes from the status endpoint's SQL aggregates —
+  // never download the full trades table (can be 100k+ rows / tens of MB).
   if (!EMAIL || !USER_STRATEGIES.length) return;
   try {
-    const r = await fetch(API + '/api/trades/' + encodeURIComponent(EMAIL));
-    const all = await r.json();
-    const allTrades = all.trades || (Array.isArray(all) ? all : []);
-    // Group by strategy_id and sum sell PnL
+    const r = await fetch(API + '/api/status/' + encodeURIComponent(EMAIL));
+    const sd = await r.json();
     const pnlMap = {};
-    allTrades.forEach(t => {
-      const sid = t.strategy_id;
-      if (!pnlMap[sid]) pnlMap[sid] = 0;
-      if (['sld','sell','dry_sld'].includes((t.side||'').toLowerCase()) || t.pnl > 0) {
-        pnlMap[sid] += (t.pnl || 0);
-      }
-    });
+    (sd.strategies || []).forEach(s => { pnlMap[s.strategy_id] = s.total_pnl; });
     USER_STRATEGIES.forEach(s => {
       if (pnlMap[s.strategy_id] !== undefined) {
         s._live_pnl = pnlMap[s.strategy_id];
@@ -3017,16 +3350,26 @@ async function toggleBot(sid, active, dryRunOverride = null) {
       } catch(e) { /* check failed, proceed with normal deploy */ }
       await _executeDeploy(sid, '/api/deploy', dryRun);
     } else {
-      const sr = await fetch(API + '/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL, broker: broker }) });
-      if (!sr.ok) { const sd = await sr.json(); throw new Error(sd.detail || 'Stop failed'); }
+      // Per-bot stop: deactivate this strategy, then redeploy the remaining
+      // active set in their own modes. Only stop the whole master process
+      // when this was the last active bot.
       await fetch(API + '/api/strategy/' + encodeURIComponent(sid) + '/toggle?active=false', { method: 'PUT' });
-      LP_BOT_RUNNING = false;
-      BOT_RUNNING = LP_BOT_RUNNING;
       s.is_active = false;
       s._is_running = false;
       _runningStrategyIds.delete(sid);
-      USER_STRATEGIES.forEach(x => { x._is_running = false; });
-      showToast('Bot stopped (' + broker + ')', 'info');
+      const othersActive = USER_STRATEGIES.some(x => x.strategy_id !== sid && x.is_active && x._is_running);
+      if (othersActive) {
+        const dr = await fetch(API + '/api/deploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL }) });
+        if (!dr.ok) { const dd = await dr.json(); throw new Error(dd.detail || dd.error || 'Redeploy of remaining bots failed'); }
+        showToast('Bot stopped — other bots redeployed and still running', 'info');
+      } else {
+        const sr = await fetch(API + '/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL, broker: broker }) });
+        if (!sr.ok) { const sd = await sr.json(); throw new Error(sd.detail || 'Stop failed'); }
+        LP_BOT_RUNNING = false;
+        BOT_RUNNING = LP_BOT_RUNNING;
+        USER_STRATEGIES.forEach(x => { x._is_running = false; });
+        showToast('Bot stopped (' + broker + ')', 'info');
+      }
       s._toggling = false;
       if (cell) cell.innerHTML = _renderDeployBtn(s);
       setTimeout(loadBots, 2000);
@@ -3163,7 +3506,9 @@ async function _executeDeploy(sid, endpoint, dryRun=false) {
       x._is_running = activeIds.has(x.strategy_id);
     });
     _runningStrategyIds = activeIds;
-    s.dry_run = result.dry_run !== undefined ? !!result.dry_run : !!dryRun;
+    // Per-bot modes: the response's dry_run is the process-level "all dry"
+    // flag; this strategy's own mode is the choice we just deployed with.
+    s.dry_run = s.is_dry_run = !!dryRun;
     _deployedAt = Date.now();
     const extra = (result.positions_closed && result.positions_closed.length) ? ' (' + result.positions_closed.length + ' positions closed)' : '';
     _deploySuccess(sid, 'Bot deployed (longport)' + extra);
@@ -3286,6 +3631,16 @@ async function createBot(andDeploy = false) {
     });
     const rData = await r.json();
     if (!r.ok) throw new Error(rData.detail || 'Failed to create strategy');
+    // Port backtest metrics onto the new bot when it was created from a backtest
+    // of the same symbol+strategy (Bots page Return/Sharpe columns read these)
+    if (_lastBtResult && _lastBtResult.symbol === sym && _lastBtResult.strategy === strat) {
+      try {
+        await fetch(API + '/api/strategies/' + encodeURIComponent(sid) + '/backtest-results', {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(_lastBtResult.metrics || {})
+        });
+      } catch (_) {}
+    }
     // Close modal immediately — don't wait for loadBots
     closeModal('newbot-modal');
     if (andDeploy) {
@@ -3614,10 +3969,11 @@ async function loadBotLiveTrades() {
   }
 
   try {
-    const r = await fetch(API + '/api/trades/' + encodeURIComponent(EMAIL));
+    // Server-side filter — never download every strategy's trades
+    const r = await fetch(API + '/api/trades/' + encodeURIComponent(EMAIL) +
+      '?strategy_id=' + encodeURIComponent(_currentBot.strategy_id) + '&limit=2000');
     const all = await r.json();
-    const allTrades = all.trades || (Array.isArray(all) ? all : []);
-    const trades = allTrades.filter(t => t.strategy_id === _currentBot.strategy_id);
+    const trades = all.trades || (Array.isArray(all) ? all : []);
 
     if (trades.length === 0) {
       document.getElementById('bd-live-empty').style.display = '';
@@ -4091,8 +4447,11 @@ async function runBacktest() {
   btn.disabled = false; btn.textContent = 'Run Backtest';
 }
 
+let _lastBtResult = null; // most recent backtest — attached to bots created from it
+
 function showBacktestResults(d, sym, strat, tf) {
   const m = d.metrics || {};
+  _lastBtResult = { symbol: sym, strategy: strat, timeframe: tf, metrics: m, at: Date.now() };
   const mf = (v, s = '') => v !== undefined && v !== null ? (typeof v === 'number' ? v.toFixed(1) : v) + s : '—';
   const hasGross = m.gross_return_pct !== undefined;
   document.getElementById('btr-return').innerHTML = mf(m.total_return_pct, '%') + (hasGross ? `<div style="font-size:10px;color:var(--text-muted);font-weight:400">Gross: ${mf(m.gross_return_pct,'%')}</div>` : '');
@@ -4765,8 +5124,9 @@ function renderAccountCards() {
       </div>
     </div>`;
   }).join('');
-  // Update home counter
-  document.getElementById('home-brokers').textContent = BROKER_ACCOUNTS.length;
+  // Update home counter (dashboard shows connected count; refresh if visible)
+  const dashBrokers = document.getElementById('dash-brokers');
+  if (dashBrokers) dashBrokers.textContent = BROKER_ACCOUNTS.filter(a => a.is_connected).length;
 }
 
 function openAddAccountModal() {
@@ -6736,7 +7096,14 @@ function studioOpenOptimize() {
 
 /* ═══════════════════ STATUS POLLING ═══════════════════ */
 async function refreshStatus() {
-  // Lightweight status check
+  // Dashboard auto-refresh — piggybacks on the existing global 10s interval
+  if (!EMAIL) return;
+  const home = document.getElementById('page-home');
+  if (!home || !home.classList.contains('active')) return;
+  try {
+    const r = await fetch(API + '/api/dashboard/' + encodeURIComponent(EMAIL));
+    renderDashboard(await r.json());
+  } catch (e) {}
 }
 
 /* ═══════════════════ SETTINGS ═══════════════════ */
