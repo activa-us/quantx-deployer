@@ -1,0 +1,11 @@
+# Railway / Nixpacks build configuration for QuantX Deployer.
+# Python 3.11 + gcc so psycopg2-binary / bcrypt / cryptography wheels resolve.
+
+[phases.setup]
+nixPkgs = ["python311", "gcc", "postgresql"]
+
+[phases.install]
+cmds = ["pip install --no-cache-dir -r requirements.txt"]
+
+[start]
+cmd = "uvicorn api.main:app --host 0.0.0.0 --port $PORT --workers 1"

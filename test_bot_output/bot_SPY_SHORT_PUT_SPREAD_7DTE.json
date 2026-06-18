@@ -1,0 +1,18 @@
+{
+  "strategy_id": "OPT_SPY_SHORT_PUT_SPREAD_7DTE",
+  "email": "test@test.com",
+  "symbol": "SPY",
+  "underlying": "SPY.US",
+  "strategy_type": "SHORT_PUT_SPREAD",
+  "target_dte": 7,
+  "strike_method": "DELTA",
+  "broker": "longport",
+  "bot_type": "lp_options",
+  "enabled": true,
+  "dry_run": true,
+  "script_path": "C:\\Users\\User\\OneDrive\\Desktop\\quantx-deployer\\quantx-deployer\\test_bot_output\\bot_SPY_SHORT_PUT_SPREAD_7DTE.py",
+  "created_at": "2026-04-24T14:44:12.833453",
+  "status": "pending",
+  "pid": null,
+  "last_heartbeat": null
+}

@@ -1,0 +1,41 @@
+{
+  "quantx_indicator_version": "1.0",
+  "indicator_id": "HTF_EMA",
+  "name": "Higher Timeframe EMA (4H from 1H)",
+  "category": "trend",
+  "description": "Resamples 1H closes into 4H bars and computes EMA. Value above HTF_EMA signals bullish higher timeframe structure; below signals bearish. Use as trend filter — only take longs when price is above HTF_EMA, shorts when below.",
+  "source": "https://www.investopedia.com/terms/e/ema.asp",
+  "author": "QuantX Wizard",
+  "inputs": ["closes"],
+  "params": [
+    {"name": "htf_bars", "label": "HTF Multiplier (4 = 4H from 1H)", "type": "int", "default": 4, "min": 2, "max": 24},
+    {"name": "period", "label": "EMA Period", "type": "int", "default": 50, "min": 5, "max": 200}
+  ],
+  "output_type": "single",
+  "output_labels": ["htf_ema"],
+  "warmup_bars": 250,
+  "calc_code": [
+    "def calc_htf_ema(closes, htf_bars=4, period=50):",
+    "    n = len(closes)",
+    "    result = [None] * n",
+    "    resampled = []",
+    "    for i in range(0, n, htf_bars):",
+    "        end = min(i + htf_bars, n)",
+    "        resampled.append(closes[end - 1])",
+    "    r = len(resampled)",
+    "    ema_vals = [None] * r",
+    "    if r < period:",
+    "        pass",
+    "    else:",
+    "        seed = sum(resampled[:period]) / period",
+    "        ema_vals[period - 1] = seed",
+    "        k = 2.0 / (period + 1)",
+    "        for i in range(period, r):",
+    "            ema_vals[i] = resampled[i] * k + ema_vals[i-1] * (1 - k)",
+    "        for i in range(n):",
+    "            htf_idx = i // htf_bars",
+    "            if htf_idx < r and ema_vals[htf_idx] is not None:",
+    "                result[i] = ema_vals[htf_idx]",
+    "    return result"
+  ]
+}
