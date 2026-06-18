@@ -277,12 +277,53 @@ def _launch_bot(script_path: str, log_path: str) -> subprocess.Popen:
     kwargs = {
         "stdout": log_fh, "stderr": log_fh,
         "cwd": os.path.dirname(script_path),
+        # The generated bot watches this PID and shuts itself down cleanly if
+        # the server dies, so force-killing the server can't orphan runners.
+        "env": {**os.environ, "QX_PARENT_PID": str(os.getpid())},
     }
     if os.name == "nt":
         kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
     else:
         kwargs["start_new_session"] = True
     return subprocess.Popen([PYTHON_EXE, script_path], **kwargs)
+
+
+def _request_stop(script_path: str) -> None:
+    """Ask a generated bot to shut down cleanly by dropping its stop-flag file.
+    The bot's stop-flag watcher notices within ~1s and runs its normal
+    save-state shutdown. Console signals can't be used: on Windows they don't
+    reach CREATE_NO_WINDOW children, and TerminateProcess skips cleanup."""
+    try:
+        with open(script_path + ".stop", "w") as f:
+            f.write(str(time.time()))
+    except OSError as e:
+        _log.warning("could not write stop flag for %s: %s", script_path, e)
+
+
+def _graceful_stop_proc(proc: subprocess.Popen, timeout: float = 10) -> None:
+    """Stop a bot Popen cleanly: stop flag first, hard kill only as fallback."""
+    script_path = proc.args[1] if len(proc.args) > 1 else ""
+    if script_path:
+        _request_stop(script_path)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _log.warning("bot %s did not stop within %ss, terminating", script_path, timeout)
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    finally:
+        # Bot deletes the flag itself on a clean stop; mop up if it didn't.
+        if script_path:
+            try:
+                os.remove(script_path + ".stop")
+            except OSError:
+                pass
 
 
 def _auto_restart_bots():
@@ -412,15 +453,16 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=_orchestrator_loop, daemon=True, name="orchestrator").start()
         _log.info("[ORCH] Orchestrator thread started (Railway mode)")
     yield  # Always yield — required by FastAPI lifespan context manager
+    # Server is exiting: ask every bot to stop cleanly (save state, close
+    # grids) via its stop flag; only escalate to a hard kill on timeout.
     for email, proc in _running_processes.items():
+        if proc.poll() is not None:
+            continue  # already exited
+        _log.info("shutdown: stopping bot for %s (pid %s)", email, proc.pid)
         try:
-            proc.terminate()
-            proc.wait(timeout=10)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            _graceful_stop_proc(proc)
+        except Exception as e:
+            _log.warning("shutdown: failed to stop bot for %s: %s", email, e)
 
 app = FastAPI(title="QuantX Deployer", lifespan=lifespan)
 
@@ -2530,7 +2572,9 @@ async def nuke_scripts(request: Request):
     email = body.get("email", "").lower().strip()
     email_safe = email.replace("@", "_at_").replace(".", "_")
 
-    # Kill running processes
+    # Ask each bot to stop cleanly (stop flag), then escalate per-PID.
+    for f in glob.glob(str(BOTS_DIR / f"{email_safe}*.py")):
+        _request_stop(f)
     killed = []
     conn = get_db()
     try:
@@ -2539,46 +2583,66 @@ async def nuke_scripts(request: Request):
         ).fetchall()
         for row in rows:
             if row["pid"]:
-                try: os.kill(row["pid"], _sig.SIGTERM)
-                except Exception: pass
                 killed.append(row["pid"])
         # Mark all stopped
         conn.execute("UPDATE processes SET status='stopped', pid=NULL WHERE email=?", (email,))
         conn.commit()
     finally:
         conn.close()
+    # Give the bots a moment to save state and exit; hard-kill any stragglers.
+    if killed:
+        import psutil
+        deadline = time.time() + 10
+        for pid in killed:
+            try:
+                p = psutil.Process(pid)
+                p.wait(timeout=max(0.5, deadline - time.time()))
+            except psutil.NoSuchProcess:
+                pass
+            except Exception:
+                try: psutil.Process(pid).kill()
+                except Exception: pass
 
-    # Delete script files
+    # Delete script files (and any leftover stop flags)
     deleted = []
     for f in glob.glob(str(BOTS_DIR / f"{email_safe}*.py")):
         try: os.remove(f); deleted.append(f)
         except Exception: pass
+        try: os.remove(f + ".stop")
+        except OSError: pass
 
     return {"killed": killed, "deleted": deleted}
 
 
 def _kill_process_by_db(email: str):
-    """Kill a process found in the DB by its PID."""
+    """Stop a process found in the DB: clean stop via flag, hard kill fallback."""
     conn = get_db()
     try:
         row = conn.execute(
-            "SELECT pid FROM processes WHERE email=? AND status='running' ORDER BY id DESC LIMIT 1",
+            "SELECT pid, master_script_path FROM processes WHERE email=? AND status='running' ORDER BY id DESC LIMIT 1",
             (email,)).fetchone()
     finally:
         conn.close()
     if not row:
         return
+    if row["master_script_path"]:
+        _request_stop(row["master_script_path"])
     try:
         import psutil
         p = psutil.Process(row["pid"])
-        p.terminate()
-        p.wait(timeout=10)
+        p.wait(timeout=10)  # clean exit via stop flag
     except Exception:
         try:
             import psutil
             psutil.Process(row["pid"]).kill()
         except Exception:
             pass
+    finally:
+        if row["master_script_path"]:
+            try:
+                os.remove(row["master_script_path"] + ".stop")
+            except OSError:
+                pass
     update_process_status(email, "stopped")
 
 
@@ -3555,15 +3619,12 @@ def _stop_process(email: str):
     proc = _running_processes.get(email)
     if proc is None:
         return
+    # Clean stop via the bot's stop-flag watcher; hard kill only on timeout.
+    # (CTRL_BREAK_EVENT doesn't work here: the bot is spawned CREATE_NO_WINDOW
+    # without CREATE_NEW_PROCESS_GROUP, so send_signal raises and we'd always
+    # fall through to a state-losing hard kill.)
     try:
-        if sys.platform == "win32":
-            proc.send_signal(signal.CTRL_BREAK_EVENT)
-        else:
-            proc.terminate()
-        proc.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
+        _graceful_stop_proc(proc, timeout=15)
     except Exception:
         try:
             proc.kill()

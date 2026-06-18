@@ -54,17 +54,8 @@ R2_ENDPOINT = os.environ.get(
 # These creds have read+write access to the quantx-results bucket (where we
 # save backtest results). Reads from options-data still use the credentials
 # embedded in api/options_data.py, which are scoped for read-only access.
-R2_ACCESS_KEY = os.environ.get(
-    "R2_RESULTS_ACCESS_KEY",
-    os.environ.get("R2_ACCESS_KEY", "29c29f49220ab561f7304bfa22740e6b"),
-)
-R2_SECRET_KEY = os.environ.get(
-    "R2_RESULTS_SECRET_KEY",
-    os.environ.get(
-        "R2_SECRET_KEY",
-        "9f2a0f004e88116b36acf9198534aa80fbcd3587c888e86ae70dc8efa7717011",
-    ),
-)
+R2_ACCESS_KEY = os.environ.get("R2_RESULTS_ACCESS_KEY") or os.environ.get("R2_ACCESS_KEY") or ""
+R2_SECRET_KEY = os.environ.get("R2_RESULTS_SECRET_KEY") or os.environ.get("R2_SECRET_KEY") or ""
 R2_RESULTS_BUCKET = "quantx-results"
 LOCAL_RESULTS_DIR = PROJECT_ROOT / "precompute_results"
 

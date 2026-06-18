@@ -78,6 +78,59 @@ def _handle_signal(signum, frame):
 
 _signal.signal(_signal.SIGTERM, _handle_signal)
 _signal.signal(_signal.SIGINT, _handle_signal)
+if hasattr(_signal, 'SIGBREAK'):  # Windows CTRL_BREAK_EVENT
+    _signal.signal(_signal.SIGBREAK, _handle_signal)
+
+# ── Clean-shutdown watchers ────────────────────────────────────────────────
+# Console signals don't reach CREATE_NO_WINDOW children on Windows, so the
+# server requests a graceful stop by dropping a "<this script>.stop" flag
+# file; we notice it within ~1s and run the normal save-state shutdown path.
+_STOP_FLAG = os.path.abspath(__file__) + '.stop'
+
+def _watch_stop_flag():
+    while not _shutdown.is_set():
+        if os.path.exists(_STOP_FLAG):
+            logger.warning('Stop flag detected -- shutting down')
+            try:
+                os.remove(_STOP_FLAG)
+            except OSError:
+                pass
+            _shutdown.set()
+            break
+        _shutdown.wait(1)
+
+threading.Thread(target=_watch_stop_flag, daemon=True, name='stop-flag-watch').start()
+
+# If the deployer server that spawned us dies (crash, force-kill, restart),
+# shut down cleanly instead of lingering as an orphan double-writing trade
+# files. The server passes its PID via QX_PARENT_PID at launch; running the
+# script by hand (no env var) skips the watcher entirely.
+_PARENT_PID = int(os.environ.get('QX_PARENT_PID', '0') or 0)
+
+def _watch_parent():
+    if os.name == 'nt':
+        import ctypes
+        SYNCHRONIZE = 0x00100000
+        h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, _PARENT_PID)
+        if not h:
+            return  # parent already gone or inaccessible
+        ctypes.windll.kernel32.WaitForSingleObject(h, 0xFFFFFFFF)  # blocks, no polling
+        ctypes.windll.kernel32.CloseHandle(h)
+        if not _shutdown.is_set():
+            logger.warning('Parent server (PID %s) exited -- shutting down', _PARENT_PID)
+            _shutdown.set()
+    else:
+        while not _shutdown.is_set():
+            try:
+                os.kill(_PARENT_PID, 0)
+            except OSError:
+                logger.warning('Parent server (PID %s) exited -- shutting down', _PARENT_PID)
+                _shutdown.set()
+                break
+            _shutdown.wait(2)
+
+if _PARENT_PID:
+    threading.Thread(target=_watch_parent, daemon=True, name='parent-watch').start()
 
 
 # ── Indicator functions (same as IBKR prod) ───────────────────────────────

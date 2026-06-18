@@ -14,7 +14,7 @@ Start command (Railway):  python orchestrator/main.py
 Environment variables:
   DATA_DIR         = /data          (Railway volume mount)
   CENTRAL_API_URL  = https://quantx-deploy.up.railway.app
-  ORCHESTRATOR_KEY = quantx-orch-2025
+  ORCHESTRATOR_KEY = <set via Railway env var>
   LONGBRIDGE_LOG_PATH = /data/logs/longbridge
 """
 
@@ -33,7 +33,7 @@ DATA_DIR        = Path(os.environ.get("DATA_DIR", "/data"))
 BOTS_DIR        = DATA_DIR / "bots"
 ORCH_LOG_DIR    = DATA_DIR / "orchestrator"
 CENTRAL_API_URL = os.environ.get("CENTRAL_API_URL", "")
-ORCH_KEY        = os.environ.get("ORCHESTRATOR_KEY", "quantx-orch-2025")
+ORCH_KEY        = os.environ.get("ORCHESTRATOR_KEY", "")
 SCAN_INTERVAL   = int(os.environ.get("SCAN_INTERVAL", 30))   # seconds
 PYTHON_EXE      = sys.executable
 
