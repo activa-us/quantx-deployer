@@ -154,6 +154,14 @@ def _ensure_day_cached(symbol: str, date_str: str) -> Path:
         try:
             import pyarrow.parquet as _pq
             _pq.read_schema(cf)  # fast metadata-only check
+            # Also enforce on the cache-hit path: a cache that was already over
+            # the cap (e.g. populated before eviction was wired in, or after the
+            # cap was lowered) would otherwise never shrink if every subsequent
+            # request is a hit and no new download triggers eviction below.
+            try:
+                enforce_cache_limit()
+            except Exception as ev:
+                log.warning("[cache] enforce_cache_limit failed: %s", ev)
             return cf
         except Exception as e:
             log.warning("[cache] Corrupted file detected, re-downloading: %s (%s)", cf, e)
@@ -509,6 +517,7 @@ def enforce_cache_limit(max_bytes: Optional[int] = None) -> dict:
 
         evicted = 0
         freed = 0
+        evicted_dirs = set()
         for _mtime, size, f in files:
             if total <= target:
                 break
@@ -519,17 +528,18 @@ def enforce_cache_limit(max_bytes: Optional[int] = None) -> dict:
             except OSError as e:
                 log.warning("[cache] eviction failed to delete %s: %s", f, e)
                 continue
+            evicted_dirs.add(f.parent)
             total -= size
             freed += size
             evicted += 1
-            # Drop any matching in-memory LRU entry (keyed by (symbol, date, ...)).
+            # Drop the matching in-memory LRU entry (keyed by (symbol, date)).
             with _cache_lock:
-                for k in [k for k in _day_cache if k[0] == sym_up and date_str in k]:
-                    _day_cache.pop(k, None)
+                _day_cache.pop((sym_up, date_str), None)
 
-        # Tidy up any symbol dirs we just emptied.
-        for sd in CACHE_DIR.iterdir():
-            if sd.is_dir() and not any(sd.iterdir()):
+        # Tidy up only the symbol dirs we just touched, instead of scanning
+        # the whole cache dir.
+        for sd in evicted_dirs:
+            if sd.exists() and sd.is_dir() and not any(sd.iterdir()):
                 try:
                     sd.rmdir()
                 except OSError:
@@ -555,3 +565,14 @@ def preload_cache(symbol: str, start_date: str, end_date: str,
         if progress_callback:
             progress_callback(i, total, d)
     return total
+
+
+# Enforce the cap once at import time too, in case the cache directory was
+# already over the limit before this process started (e.g. the cap was
+# lowered via OPTIONS_CACHE_MAX_GB, or files accumulated before eviction
+# was wired in). Without this, a cache that's all hits from the start would
+# never trigger eviction.
+try:
+    enforce_cache_limit()
+except Exception as _ev:
+    log.warning("[cache] startup enforce_cache_limit failed: %s", _ev)
